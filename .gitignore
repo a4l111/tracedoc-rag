@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+data/raw/
+data/parsed/
+data/indexes/
+data/models/
+data/evaluation/
+data/service/
+data/benchmarks/
+/MMLongBench-Doc/

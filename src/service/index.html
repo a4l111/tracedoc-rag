@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文档问答</title>
+<style>
+body{font:16px/1.5 system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#1d2733;background:#f6f8fb}
+section{background:#fff;border:1px solid #d7dfe9;border-radius:9px;padding:18px;margin:16px 0}button,input,select,textarea{font:inherit;margin:4px}button{padding:5px 12px;cursor:pointer}textarea{width:95%;min-height:70px}pre{white-space:pre-wrap;word-break:break-word}li{margin:8px 0}.warning{background:#fff1d8;padding:10px;border-radius:5px}.muted{color:#5d6875}
+</style>
+<h1>局域网文档问答</h1>
+<p class="warning">此服务无需登录。同一局域网内能访问该服务的人可上传、查看文档及问答内容。仅在可信网络使用，不要映射到公网。构建会把文本发送至模力方舟；问答会把检索片段发送至 DeepSeek。</p>
+<section><h2>文档</h2><input id="file" type="file"><button id="upload">上传并解析</button><button id="parse">解析 data/raw</button><ul id="docs"></ul></section>
+<section><h2>构建索引</h2><select id="mode"><option value="structured">按标题切块</option><option value="fixed">固定窗口</option></select><button id="build">开始构建</button><p class="muted">构建需要模型额度；进行中会显示阶段和完成状态。</p><ul id="jobs"></ul></section>
+<section><h2>提问</h2><select id="snapshot"></select><textarea id="question" placeholder="输入问题"></textarea><br><label><input id="answer" type="checkbox" checked>调用 DeepSeek 生成回答</label><button id="ask">查询</button><pre id="response"></pre><ul id="hits"></ul></section>
+<script>
+const $=id=>document.getElementById(id);
+async function api(path,options){const response=await fetch(path,options);let value=await response.json();if(!response.ok)throw Error(value.detail||response.statusText);return value}
+function item(parent,text){let li=document.createElement('li');li.textContent=text;parent.append(li);return li}
+async function refresh(){
+ const [docs,jobs,snapshots]=await Promise.all([api('/api/documents'),api('/api/jobs'),api('/api/snapshots')]);
+ $('docs').replaceChildren();docs.forEach(d=>{let li=item($('docs'),`${d.source_file}（${d.source_type}，错误 ${d.errors}，图片 ${d.images}） `);let a=document.createElement('a');a.textContent='查看 Markdown';a.href='/api/source/'+encodeURIComponent(d.doc_id);a.target='_blank';li.append(a)});
+ $('jobs').replaceChildren();jobs.forEach(j=>item($('jobs'),`${j.kind} ${j.state} · ${j.stage} · ${j.completed}/${j.total??'?'} · 错误 ${j.errors}${j.snapshot_id?' · '+j.snapshot_id:''}${j.error?' · '+j.error:''}`));
+ const selected=$('snapshot').value;$('snapshot').replaceChildren();snapshots.filter(s=>s.complete).forEach(s=>{let o=document.createElement('option');o.value=s.snapshot_id;o.textContent=`${s.snapshot_id} (${s.chunk_count} chunks)`;$('snapshot').append(o)});if(selected)$('snapshot').value=selected;
+}
+async function task(path,options){try{let value=await api(path,options);alert('任务已排队：'+value.job_id);refresh()}catch(e){alert(e.message)}}
+$('upload').onclick=()=>{let f=$('file').files[0];if(!f)return alert('请选择文件');let body=new FormData();body.append('file',f);task('/api/upload',{method:'POST',body})};
+$('parse').onclick=()=>task('/api/parse',{method:'POST'});
+$('build').onclick=()=>task('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chunk_mode:$('mode').value})});
+$('ask').onclick=async()=>{ $('response').textContent='检索中…';$('hits').replaceChildren();try{let result=await api('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:$('question').value,snapshot_id:$('snapshot').value||null,answer:$('answer').checked})});$('response').textContent=result.answer||'仅检索，未调用 DeepSeek';result.hits.forEach((h,i)=>{let li=item($('hits'),`[${i+1}] ${h.source} · ${h.page_start?'第'+h.page_start+'页':h.slide_start?'第'+h.slide_start+'张幻灯片':h.heading_path.join(' / ')} · ${h.score}\n${h.text}\n`);let a=document.createElement('a');a.href='/api/source/'+encodeURIComponent(h.doc_id);a.target='_blank';a.textContent='查看来源';li.append(a)})}catch(e){$('response').textContent=e.message}};
+refresh().catch(e=>{$('response').textContent=e.message});setInterval(()=>refresh().catch(()=>{}),5000);
+</script></html>

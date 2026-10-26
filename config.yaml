@@ -1,0 +1,19 @@
+# The parse command is local and does not call a model.
+paths:
+  raw: data/raw
+  parsed: data/parsed
+
+# DeepSeek generates the final answer from locally retrieved evidence.
+qa:
+  provider: deepseek
+  model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+
+# Qwen3 embeddings use MoArk; bge-m3 stays local. DeepSeek is never used for embeddings.
+embedding:
+  dense_provider: moark
+  bge_provider: local
+
+reranker:
+  provider: moark
+  model: Qwen3-Reranker-8B
