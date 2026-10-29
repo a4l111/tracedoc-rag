@@ -84,10 +84,10 @@
 
 ### 6.1 源码包
 
-- [ ] 整理 GitHub 仓库和源码压缩包，包含 `app.py`、`src/`、`tests/`、`requirements.txt`、`config.yaml`、`.env.example`、`README.md`、`AGENTS.md`、`list.md` 和 `SUBMISSION_PLAN.md`。
-- [ ] 不提交 `.env`、真实 API Key、DPAPI 密钥文件、私人文档、模型缓存、FAISS 大索引、会话数据库及请求日志。
+- [x] 已整理并推送 GitHub 仓库，制作源码压缩包；包含 `app.py`、`src/`、`tests/`、`requirements.txt`、`config.yaml`、`.env.example`、`README.md`、`AGENTS.md`、`list.md` 和 `SUBMISSION_PLAN.md`。
+- [x] Git 索引及源码包均已检查：没有 `.env`、真实 API Key、DPAPI 密钥文件、私人文档、模型缓存、FAISS 大索引、会话数据库或请求日志；`data/validation/` 已加入忽略规则。
 - [ ] 确认克隆源码后可以按照 README 创建 Python 3.10+ 环境并运行 CLI 与 Web。
-- [ ] 保存最终 Git commit ID，并在提交说明中注明对应版本。
+- [x] 已保存源码交付 Git commit ID；源码包内 `SOURCE_COMMIT.txt` 记录对应版本。
 - [ ] 如课程要求附带评测产物，单独提供脱敏压缩包；不要把被 `.gitignore` 忽略的大型 `data/` 直接提交 GitHub。
 
 ### 6.2 Windows 可执行文件
