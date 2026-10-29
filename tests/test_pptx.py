@@ -34,6 +34,8 @@ class PptxTests(unittest.TestCase):
             second = slide("Second")
             second = second.replace('</p:spTree>',
                                     '<p:pic><p:blipFill><a:blip r:embed="rIdImage"/></p:blipFill></p:pic>'
+                                    '<p:grpSp><p:sp><p:txBody><a:p><a:r><a:t>Grouped detail</a:t>'
+                                    '</a:r></a:p></p:txBody></p:sp></p:grpSp>'
                                     '</p:spTree>')
             with ZipFile(raw / "sample.pptx", "w") as archive:
                 archive.writestr("ppt/presentation.xml", f'<p:presentation xmlns:p="{p}" xmlns:r="{r}">'
@@ -63,6 +65,7 @@ class PptxTests(unittest.TestCase):
             self.assertIn("<!-- SLIDE:1 -->", markdown)
             self.assertIn("Speaker detail", markdown)
             self.assertIn("Diagram OCR", markdown)
+            self.assertIn("Grouped detail", markdown)
             self.assertEqual(manifest["slide_count"], 2)
             self.assertEqual(manifest["page_map"], [])
             self.assertEqual(manifest["image_assets"][0]["slide"], 1)

@@ -56,6 +56,16 @@ def _notes(archive: zipfile.ZipFile, rels: dict[str, tuple[str, str]]) -> str:
     return ""
 
 
+def _content_nodes(container: ET.Element):
+    """Yield slide content in document order, including shapes inside groups."""
+    supported = {f"{{{P}}}sp", f"{{{P}}}graphicFrame", f"{{{P}}}pic"}
+    for node in container:
+        if node.tag in supported:
+            yield node
+        elif node.tag == f"{{{P}}}grpSp":
+            yield from _content_nodes(node)
+
+
 def parse_pptx(source: Path, images_dir: Path, manifest: dict[str, Any],
                ocr_text: Callable[[Path, dict[str, Any]], str]) -> str:
     sections = []
@@ -84,7 +94,7 @@ def parse_pptx(source: Path, images_dir: Path, manifest: dict[str, Any],
                 sections.append("\n\n".join(blocks))
                 continue
             recent_text = ""
-            for shape in tree:
+            for shape in _content_nodes(tree):
                 if shape.tag in {f"{{{P}}}sp", f"{{{P}}}graphicFrame"}:
                     value = _text(shape)
                     if not value:

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from zipfile import ZipFile
 
 import fitz
@@ -15,6 +16,32 @@ from src.parser.tables import docx_table
 
 
 class TableParsingTests(unittest.TestCase):
+    def test_image_only_pdf_ocr_is_opt_in_and_marked_unreviewed(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            root = Path(temp)
+            raw = root / "raw"
+            raw.mkdir()
+            picture = BytesIO()
+            Image.new("RGB", (100, 50), "white").save(picture, format="PNG")
+            document = fitz.open()
+            page = document.new_page()
+            page.insert_image(fitz.Rect(72, 72, 172, 122), stream=picture.getvalue())
+            document.save(raw / "scan.pdf")
+            document.close()
+
+            with patch("src.parser.pipeline._ocr_text", return_value="Scanned heading") as ocr:
+                self.assertTrue(parse_file(raw / "scan.pdf", raw, root / "parsed", ocr_scanned_pages=True))
+            self.assertEqual(ocr.call_count, 1)
+            folder = next((root / "parsed").iterdir())
+            markdown = (folder / "document.md").read_text(encoding="utf-8")
+            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            self.assertIn("<!-- PAGE:1 -->", markdown)
+            self.assertIn("![PDF page 1 OCR source](images/page-0001.png)", markdown)
+            self.assertIn("OCR:local page=1 review_status=unreviewed", markdown)
+            self.assertIn("Scanned heading", markdown)
+            self.assertEqual(manifest["image_assets"][-1]["ocr_character_count"], len("Scanned heading"))
+            self.assertTrue((folder / manifest["image_assets"][-1]["path"]).is_file())
+
     def test_pdf_image_asset_has_real_page_and_nearby_text(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
             root = Path(temp)

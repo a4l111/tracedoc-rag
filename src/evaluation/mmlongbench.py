@@ -46,9 +46,9 @@ def prepare(source_dir: Path, output_dir: Path, max_documents: int = 3) -> dict:
             continue
         try:
             pages = ast.literal_eval(sample["evidence_pages"])
-            if not isinstance(pages, list) or any(type(page) is not int or page < 0 or page >= page_counts[name]
+            if not isinstance(pages, list) or any(type(page) is not int or page < 1 or page > page_counts[name]
                                                    for page in pages):
-                raise ValueError("invalid zero-based evidence pages")
+                raise ValueError("invalid one-based evidence pages")
         except (SyntaxError, ValueError, TypeError) as exc:
             invalid.append({"row": row_number, "doc_id": name, "reason": str(exc)})
             continue
@@ -62,7 +62,7 @@ def prepare(source_dir: Path, output_dir: Path, max_documents: int = 3) -> dict:
                 invalid.append({"row": row_number, "doc_id": name,
                                 "reason": "answer exists but evidence_pages is empty"})
             continue
-        record["relevant"] = [{"doc_id": _doc_id(documents / name, documents), "page": page + 1}
+        record["relevant"] = [{"doc_id": _doc_id(documents / name, documents), "page": page}
                               for page in sorted(set(pages))]
         gold.append(record)
 
@@ -74,7 +74,7 @@ def prepare(source_dir: Path, output_dir: Path, max_documents: int = 3) -> dict:
                "selected_documents": names, "parsed_documents": len(names) - len(failures),
                "failed_documents": failures, "answerable_questions": len(gold),
                "unanswerable_questions": len(unanswerable), "invalid_labels": invalid,
-               "page_rule": "benchmark zero-based evidence_pages + 1 = parser PAGE:n",
+               "page_rule": "benchmark one-based evidence_pages = parser PAGE:n",
                "parsed_dir": str(parsed.resolve()), "gold_path": str(gold_path.resolve())}
     (output_dir / "import_report.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
                                                      encoding="utf-8")

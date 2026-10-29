@@ -4,6 +4,7 @@ import hashlib
 import json
 import pickle
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -14,6 +15,12 @@ from src.index.build import MODELS, LOCAL_BGE_DIR, tokenize
 from src.utils import moark
 
 ROUTES = ("bm25", "dense", "bge_m3")
+
+
+@lru_cache(maxsize=2)
+def _bge_model(loader_name: str):
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(loader_name, local_files_only=True)
 
 
 def search(indexes_dir: Path, snapshot_id: str, route: str, question: str, top_k: int = 5) -> list[dict]:
@@ -64,7 +71,6 @@ def search(indexes_dir: Path, snapshot_id: str, route: str, question: str, top_k
     if route == "dense":
         vector = moark.embed(moark.client(), question)
     else:
-        from sentence_transformers import SentenceTransformer
         loader_name = model_name
         if meta.get("model_source") == "local":
             weight = LOCAL_BGE_DIR / "pytorch_model.bin"
@@ -77,7 +83,7 @@ def search(indexes_dir: Path, snapshot_id: str, route: str, question: str, top_k
             if digest.hexdigest() != meta.get("weight_sha256"):
                 raise ValueError("Local bge-m3 weights do not match this snapshot")
             loader_name = str(LOCAL_BGE_DIR)
-        model = SentenceTransformer(loader_name, local_files_only=True)
+        model = _bge_model(loader_name)
         vector = np.asarray(model.encode(question, normalize_embeddings=True), dtype="float32")
     if vector.shape != (dimension,) or not np.isfinite(vector).all() or np.linalg.norm(vector) == 0:
         raise ValueError("Invalid query embedding")
@@ -109,6 +115,31 @@ def latest_complete_snapshot(indexes_dir: Path) -> str:
     raise FileNotFoundError("No complete MoArk Qwen3-Embedding-8B snapshot found; run build")
 
 
+def fuse_and_rerank(question: str, rankings: dict[str, list[dict]],
+                    on_step: Callable[[str], None] | None = None) -> list[dict]:
+    """Fuse three precomputed Top-20 rankings with RRF and rerank the Top 50."""
+    fused: dict[str, dict] = {}
+    for route in ROUTES:
+        if route not in rankings:
+            raise ValueError(f"Missing ranking: {route}")
+        for rank, chunk in enumerate(rankings[route][:20], start=1):
+            entry = fused.setdefault(chunk["chunk_id"], {"chunk": chunk, "rrf_score": 0.0})
+            entry["rrf_score"] += 1.0 / (60 + rank)
+    candidates = sorted(fused.values(), key=lambda item: (-item["rrf_score"], item["chunk"]["chunk_id"]))[:50]
+    if not candidates:
+        return []
+
+    if on_step:
+        on_step("Reranking candidates")
+    rerank_api, rerank_endpoint = moark.rerank_client()
+    scores = moark.rerank(rerank_api, question, [item["chunk"]["text"] for item in candidates], rerank_endpoint)
+    if (len(scores) != len(candidates) or np.isnan(scores).any() or np.isposinf(scores).any()
+            or np.isfinite(scores).sum() < min(5, len(candidates))):
+        raise ValueError("Invalid reranker scores")
+    ranked = sorted(zip(candidates, scores), key=lambda pair: (-float(pair[1]), pair[0]["chunk"]["chunk_id"]))
+    return [{**item["chunk"], "score": float(score)} for item, score in ranked[:5]]
+
+
 def query(indexes_dir: Path, snapshot_id: str, question: str,
           on_step: Callable[[str], None] | None = None) -> list[dict]:
     """Retrieve 20 per route, fuse 50 by RRF, and rerank to five."""
@@ -124,23 +155,9 @@ def query(indexes_dir: Path, snapshot_id: str, question: str,
     snapshot = json.loads((indexes_dir / snapshot_id / "snapshot.json").read_text(encoding="utf-8"))
     if snapshot.get("model_config", {}).get("reranker") != {"provider": "moark", "model": moark.RERANK_MODEL}:
         raise ValueError("Snapshot reranker configuration does not match MoArk; rebuild")
-
-    fused: dict[str, dict] = {}
+    rankings = {}
     for route in ROUTES:
         if on_step:
             on_step(f"Searching {route}")
-        for rank, chunk in enumerate(search(indexes_dir, snapshot_id, route, question, top_k=20), start=1):
-            entry = fused.setdefault(chunk["chunk_id"], {"chunk": chunk, "rrf_score": 0.0})
-            entry["rrf_score"] += 1.0 / (60 + rank)
-    candidates = sorted(fused.values(), key=lambda item: (-item["rrf_score"], item["chunk"]["chunk_id"]))[:50]
-    if not candidates:
-        return []
-
-    if on_step:
-        on_step("Reranking candidates")
-    rerank_api, rerank_endpoint = moark.rerank_client()
-    scores = moark.rerank(rerank_api, question, [item["chunk"]["text"] for item in candidates], rerank_endpoint)
-    if len(scores) != len(candidates) or not np.isfinite(scores).all():
-        raise ValueError("Invalid reranker scores")
-    ranked = sorted(zip(candidates, scores), key=lambda pair: (-float(pair[1]), pair[0]["chunk"]["chunk_id"]))
-    return [{**item["chunk"], "score": float(score)} for item, score in ranked[:5]]
+        rankings[route] = search(indexes_dir, snapshot_id, route, question, top_k=20)
+    return fuse_and_rerank(question, rankings, on_step)

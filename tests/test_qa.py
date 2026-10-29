@@ -35,23 +35,27 @@ class AnswerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _call(self, response_text: str):
+    def _call(self, response_text: str, history=None):
         completion = Mock()
         completion.create.return_value = _response(response_text)
         client = Mock()
         client.chat.completions = completion
-        with patch("src.qa.answer.os.getenv", return_value="test-key"), \
+        with patch("src.qa.answer.get_api_key", return_value="test-key"), \
              patch("src.qa.answer.OpenAI", return_value=client):
             result = answer_question(self.root, self.snapshot_id, "结论是什么？",
-                                     self.root / "config.yaml", chunks=self.chunks)
+                                     self.root / "config.yaml", chunks=self.chunks, history=history)
         return result, completion
 
     def test_valid_citations_are_rendered_from_selected_chunks(self):
-        result, completion = self._call("两个来源给出不同结论：[1][2]")
+        result, completion = self._call("两个来源给出不同结论：[1][2]",
+                                        history=[{"question": "上一问", "answer": "旧回答[9]"}])
         self.assertIn("[1] a.pdf，第1页", result)
         self.assertIn("[2] b.pdf，第2页", result)
         prompt = completion.create.call_args.kwargs["messages"][0]["content"]
         self.assertIn("来源相互冲突", prompt)
+        user_prompt = completion.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("旧回答[9]", user_prompt)
+        self.assertIn("本轮 Context", user_prompt)
 
     def test_fabricated_citation_falls_back_to_retrieval(self):
         result, _ = self._call("结论见[3]")
@@ -64,7 +68,8 @@ class AnswerTests(unittest.TestCase):
         self.assertIn("引用：\n无", result)
 
     def test_missing_key_returns_evidence_without_api_call(self):
-        with patch("src.qa.answer.os.getenv", return_value=""), patch("src.qa.answer.OpenAI") as client:
+        with patch("src.qa.answer.get_api_key", side_effect=ValueError("missing")), \
+             patch("src.qa.answer.OpenAI") as client:
             result = answer_question(self.root, self.snapshot_id, "问题", self.root / "config.yaml",
                                      chunks=self.chunks)
         self.assertIn("缺少 DEEPSEEK_API_KEY", result)

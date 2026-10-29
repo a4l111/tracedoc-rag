@@ -6,7 +6,7 @@ import pickle
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import faiss
 import jieba
@@ -72,6 +72,7 @@ def _load_chunks(parsed_dir: Path, mode: str) -> tuple[list[dict[str, Any]], lis
 def _build_vector_index(
     folder: Path, route: str, chunks: list[dict[str, Any]], snapshot_id: str,
     snapshot_sha256: str, errors: list[dict[str, Any]], download_models: bool,
+    on_progress: Callable[[str, int, int, int], None] | None = None,
 ) -> dict[str, Any]:
     model_name, dimension, index_name, meta_name = MODELS[route]
     index = faiss.IndexFlatIP(dimension)
@@ -87,12 +88,36 @@ def _build_vector_index(
     except Exception as exc:
         model = None
         load_error = f"{type(exc).__name__}: {exc}"
-    for chunk in track(chunks, description=f"Embedding {route}", console=Console()):
+    if route == "dense" and model is not None:
+        processed = 0
+        for start in track(range(0, len(chunks), moark.EMBED_BATCH_SIZE),
+                           description=f"Embedding {route}", console=Console()):
+            batch = chunks[start:start + moark.EMBED_BATCH_SIZE]
+            try:
+                vectors = (moark.embed_many(model, [chunk["text"] for chunk in batch])
+                           if len(batch) > 1 else [moark.embed(model, batch[0]["text"])])
+                for chunk, vector in zip(batch, vectors):
+                    index.add(vector.reshape(1, dimension))
+                    successful_ids.append(chunk["chunk_id"])
+            except Exception:
+                # Retry individually so one bad chunk cannot discard the rest of a batch.
+                for chunk in batch:
+                    try:
+                        vector = moark.embed(model, chunk["text"])
+                        index.add(vector.reshape(1, dimension))
+                        successful_ids.append(chunk["chunk_id"])
+                    except Exception as exc:
+                        errors.append({"stage": route, "chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"],
+                                       "type": type(exc).__name__, "message": str(exc)})
+            processed += len(batch)
+            if on_progress:
+                on_progress(route, processed, len(chunks), len(errors))
+    else:
+      for processed, chunk in enumerate(track(chunks, description=f"Embedding {route}", console=Console()), 1):
         try:
             if model is None:
                 raise RuntimeError(f"Model unavailable: {load_error}")
-            vector = (moark.embed(model, chunk["text"]) if route == "dense" else
-                      np.asarray(model.encode(chunk["text"], normalize_embeddings=True), dtype="float32"))
+            vector = np.asarray(model.encode(chunk["text"], normalize_embeddings=True), dtype="float32")
             if vector.shape != (dimension,) or not np.isfinite(vector).all() or np.linalg.norm(vector) == 0:
                 raise ValueError(f"Invalid embedding shape or values: {vector.shape}")
             index.add(vector.reshape(1, dimension))
@@ -100,6 +125,8 @@ def _build_vector_index(
         except Exception as exc:
             errors.append({"stage": route, "chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"],
                            "type": type(exc).__name__, "message": str(exc)})
+        if on_progress:
+            on_progress(route, processed, len(chunks), len(errors))
     faiss.write_index(index, str(folder / index_name))
     meta = {"snapshot_id": snapshot_id, "chunks_sha256": snapshot_sha256,
             "model": model_name, "dimension": dimension, "chunk_ids": successful_ids,
@@ -112,7 +139,8 @@ def _build_vector_index(
             "failed_count": len(chunks) - len(successful_ids), "model_load_error": load_error}
 
 
-def build(parsed_dir: Path, indexes_dir: Path, mode: str = "structured", download_models: bool = False) -> Path:
+def build(parsed_dir: Path, indexes_dir: Path, mode: str = "structured", download_models: bool = False,
+          on_progress: Callable[[str, int, int, int], None] | None = None) -> Path:
     if not parsed_dir.is_dir() or not any(parsed_dir.glob("*/manifest.json")):
         raise ValueError(f"No parsed manifests found in {parsed_dir}")
     if mode not in {"fixed", "structured"}:
@@ -124,6 +152,8 @@ def build(parsed_dir: Path, indexes_dir: Path, mode: str = "structured", downloa
     chunks, sources, errors = _load_chunks(parsed_dir, mode)
     if not chunks:
         raise ValueError("No usable chunks found in parsed artifacts")
+    if on_progress:
+        on_progress("chunking", len(chunks), len(chunks), len(errors))
     chunk_bytes = b"".join((json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8") for chunk in chunks)
     (folder / "chunks.jsonl").write_bytes(chunk_bytes)
     chunks_sha256 = hashlib.sha256(chunk_bytes).hexdigest()
@@ -136,6 +166,8 @@ def build(parsed_dir: Path, indexes_dir: Path, mode: str = "structured", downloa
     _write_json(folder / "snapshot.json", snapshot)
 
     tokens = [tokenize(chunk["text"]) for chunk in track(chunks, description="Tokenizing BM25", console=Console())]
+    if on_progress:
+        on_progress("bm25", len(chunks), len(chunks), len(errors))
     bm25 = BM25Okapi(tokens)
     with (folder / "bm25.pkl").open("wb") as stream:
         pickle.dump({"snapshot_id": snapshot_id, "chunks_sha256": chunks_sha256,
@@ -144,7 +176,7 @@ def build(parsed_dir: Path, indexes_dir: Path, mode: str = "structured", downloa
     routes = {"bm25": {"indexed_count": len(chunks), "failed_count": 0}}
     for route in MODELS:
         routes[route] = _build_vector_index(folder, route, chunks, snapshot_id,
-                                            chunks_sha256, errors, download_models)
+                                            chunks_sha256, errors, download_models, on_progress)
     with (folder / "errors.jsonl").open("w", encoding="utf-8") as stream:
         for error in errors:
             stream.write(json.dumps(error, ensure_ascii=False) + "\n")

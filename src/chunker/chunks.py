@@ -26,7 +26,8 @@ def _clean_lines(markdown: str) -> list[tuple[str, int | None, int | None]]:
             slide = int(match.group(1))
             page = None
         elif not COMMENT.match(line.strip()):
-            lines.append((line, page, slide))
+            for part in line.split("<br>") if line.lstrip().startswith("|") else (line,):
+                lines.append((part, page, slide))
     return lines
 
 
@@ -61,6 +62,42 @@ def _windows(lines: list[tuple[str, int | None, int | None]], split: bool) -> li
                            max(found_slides) if found_slides else None))
         if end == len(text):
             break
+    return result
+
+
+def _table_context_windows(markdown: str) -> list[tuple[str, int | None, int | None, int | None, int | None]]:
+    """Keep a page's opening chart context with long Markdown table rows."""
+    pages: dict[int, list[str]] = {}
+    tables: list[tuple[int, str]] = []
+    page: int | None = None
+    for line in markdown.splitlines():
+        if match := PAGE.match(line.strip()):
+            page = int(match.group(1))
+            continue
+        if page is None or COMMENT.match(line.strip()):
+            continue
+        if line.lstrip().startswith("|") and "<br>" in line:
+            tables.append((page, line))
+        elif not line.lstrip().startswith("|"):
+            pages.setdefault(page, []).append(line.strip())
+
+    result = []
+    for page, table in tables:
+        opening = " ".join(value for value in pages.get(page, []) if value)
+        # The page opening is source text, including its chart title and column labels.
+        context = opening[:160].strip() + "\n"
+        rows = [row.strip() for row in table.split("<br>") if row.strip()]
+        if len(rows) < 2:
+            continue
+        body = "\n".join(rows)
+        width = WINDOW - len(context)
+        step = max(1, width - 100)
+        for start in range(0, len(body), step):
+            value = context + body[start:start + width]
+            if value.strip():
+                result.append((value.strip(), page, page, None, None))
+            if start + width >= len(body):
+                break
     return result
 
 
@@ -109,5 +146,20 @@ def make_chunks(markdown: str, manifest: dict[str, Any], mode: str) -> list[dict
                 "slide_start": slide_start,
                 "slide_end": slide_end,
                 "heading_path": heading_path,
+            })
+    if mode == "structured":
+        for value, page_start, page_end, slide_start, slide_end in _table_context_windows(markdown):
+            ordinal = len(chunks) + 1
+            identity = f"{doc_id}\0{mode}\0{ordinal}\0{value}"
+            chunks.append({
+                "chunk_id": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24],
+                "display_name": f"{source_name} · table · #{ordinal}",
+                "doc_id": doc_id,
+                "text": value,
+                "page_start": page_start,
+                "page_end": page_end,
+                "slide_start": slide_start,
+                "slide_end": slide_end,
+                "heading_path": [],
             })
     return chunks

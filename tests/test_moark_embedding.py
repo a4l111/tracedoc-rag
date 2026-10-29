@@ -17,7 +17,7 @@ from src.utils import moark
 
 class MoArkEmbeddingTests(unittest.TestCase):
     def test_missing_key(self) -> None:
-        with patch.dict("os.environ", {"MOARK_API_KEY": "your_key_here"}):
+        with patch.object(moark, "get_api_key", side_effect=ValueError("MOARK_API_KEY is missing")):
             with self.assertRaisesRegex(ValueError, "MOARK_API_KEY"):
                 moark.client()
 
@@ -42,9 +42,21 @@ class MoArkEmbeddingTests(unittest.TestCase):
                                 for i in range(len(body["documents"]))]}
         api = SimpleNamespace(post=post)
         scores = moark.rerank(api, "问题", [str(i) for i in range(45)], "/rerank")
-        self.assertEqual([len(batch) for batch in calls], [20, 20, 5])
-        self.assertEqual(scores[20], 0.0)
-        self.assertEqual(scores[44], 4.0)
+        self.assertEqual([len(batch) for batch in calls], [20, 20, 5, 17])
+        self.assertTrue(np.isneginf(scores[0]))
+        self.assertTrue(np.isfinite(scores[44]))
+        self.assertEqual(np.isfinite(scores).sum(), 17)
+
+    def test_rerank_diagnostics_do_not_include_document_text(self) -> None:
+        api = SimpleNamespace(post=lambda endpoint, cast_to, body: {"results": [
+            {"index": i, "relevance_score": float(i)} for i in range(len(body["documents"]))
+        ]})
+        scores, diagnostics = moark.rerank_with_diagnostics(api, "问题", [str(i) for i in range(25)], "/rerank")
+        self.assertEqual(len(scores), 25)
+        self.assertEqual(len(diagnostics), 25)
+        self.assertFalse(any("text" in item or "document" in item for item in diagnostics))
+        self.assertTrue(any(not item["advanced"] for item in diagnostics))
+        self.assertTrue(all(item["final_score"] is None for item in diagnostics if not item["advanced"]))
 
     def test_embedding_dimension_and_normalization(self) -> None:
         calls = []
@@ -57,6 +69,16 @@ class MoArkEmbeddingTests(unittest.TestCase):
         self.assertEqual(calls[0]["dimensions"], 4096)
         self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0)
         self.assertEqual(float(vector[0]), 1.0)
+
+    def test_batch_embedding_preserves_api_indexes(self) -> None:
+        first = [3.0] + [0.0] * (moark.DIMENSION - 1)
+        second = [0.0, 4.0] + [0.0] * (moark.DIMENSION - 2)
+        response = SimpleNamespace(data=[SimpleNamespace(index=1, embedding=second),
+                                         SimpleNamespace(index=0, embedding=first)])
+        api = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **kwargs: response))
+        vectors = moark.embed_many(api, ["first", "second"])
+        self.assertEqual(float(vectors[0][0]), 1.0)
+        self.assertEqual(float(vectors[1][1]), 1.0)
 
     def test_missing_key_does_not_create_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:

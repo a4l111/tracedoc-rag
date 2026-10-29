@@ -1,5 +1,10 @@
 .env
 .venv/
+.build-venv/
+.tmp/
+build/
+dist/
+release/
 __pycache__/
 *.py[cod]
 data/raw/
@@ -9,4 +14,6 @@ data/models/
 data/evaluation/
 data/service/
 data/benchmarks/
+data/acceptance/
+data/validation/
 /MMLongBench-Doc/

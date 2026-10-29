@@ -6,7 +6,8 @@ import re
 import statistics
 from pathlib import Path
 
-from src.retrieval.query import ROUTES, query, search
+from src.retrieval.query import ROUTES, fuse_and_rerank, search
+from src.utils.moark import RERANK_STRATEGY
 
 
 def _read_gold(path: Path) -> list[dict]:
@@ -45,7 +46,10 @@ def _relevant_groups(chunks: list[dict], labels: list[dict]) -> list[set[str]]:
     return [_relevant_ids(chunks, [label]) for label in labels]
 
 
-def evaluate_snapshot(indexes_dir: Path, snapshot_id: str, gold_path: Path, k: int = 5) -> dict:
+def evaluate_snapshot(indexes_dir: Path, snapshot_id: str, gold_path: Path, k: int = 5,
+                      checkpoint_path: Path | None = None,
+                      enabled_routes: tuple[str, ...] = ROUTES,
+                      hybrid: bool = True) -> dict:
     """Compute macro Recall@K and MRR for each route and final reranked results."""
     if not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}", snapshot_id):
         raise ValueError("Invalid snapshot_id")
@@ -61,16 +65,40 @@ def evaluate_snapshot(indexes_dir: Path, snapshot_id: str, gold_path: Path, k: i
         raise ValueError("Chunk snapshot checksum mismatch")
     chunks = [json.loads(line) for line in chunk_bytes.splitlines()]
     examples = _read_gold(gold_path)
-    routes = (*ROUTES, "hybrid_reranked")
+    if any(route not in ROUTES for route in enabled_routes):
+        raise ValueError("Unknown evaluation route")
+    if hybrid and set(enabled_routes) != set(ROUTES):
+        raise ValueError("Hybrid evaluation requires all three routes")
+    routes = (*enabled_routes, "hybrid_reranked") if hybrid else enabled_routes
     recall_key = f"recall_at_{k}"
     totals = {route: {recall_key: 0.0, "reciprocal_rank": 0.0} for route in routes}
+    checkpoint_meta = {"snapshot_id": snapshot_id, "chunks_sha256": snapshot["chunks_sha256"],
+                       "gold_sha256": hashlib.sha256(gold_path.read_bytes()).hexdigest(),
+                       "k": k, "routes": list(routes),
+                       "rerank_strategy": RERANK_STRATEGY if hybrid else None}
+    cached = {}
+    if checkpoint_path and checkpoint_path.is_file():
+        saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if saved.get("meta") != checkpoint_meta:
+            raise ValueError("Evaluation checkpoint does not match snapshot, gold labels, routes, or K")
+        cached = saved.get("questions", {})
     details = []
     for example in examples:
+        cache_key = hashlib.sha256(json.dumps(example, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        if cache_key in cached:
+            question_detail = cached[cache_key]
+            details.append(question_detail)
+            for route in routes:
+                totals[route][recall_key] += question_detail["routes"][route][recall_key]
+                totals[route]["reciprocal_rank"] += question_detail["routes"][route]["reciprocal_rank"]
+            continue
         groups = _relevant_groups(chunks, example["relevant"])
         relevant = set().union(*groups)
-        results = {route: search(indexes_dir, snapshot_id, route, example["question"], top_k=k)
-                   for route in ROUTES}
-        results["hybrid_reranked"] = query(indexes_dir, snapshot_id, example["question"])
+        rankings = {route: search(indexes_dir, snapshot_id, route, example["question"], top_k=20)
+                    for route in enabled_routes}
+        results = {route: ranked[:k] for route, ranked in rankings.items()}
+        if hybrid:
+            results["hybrid_reranked"] = fuse_and_rerank(example["question"], rankings)
         question_detail = {"question": example["question"], "relevant_chunk_count": len(relevant),
                            "relevant_location_count": len(groups),
                            "unindexed_labels": [label for label, group in zip(example["relevant"], groups) if not group],
@@ -88,6 +116,13 @@ def evaluate_snapshot(indexes_dir: Path, snapshot_id: str, gold_path: Path, k: i
                                                                    if not group.intersection(ids)],
                                                  recall_key: recall, "reciprocal_rank": reciprocal_rank}
         details.append(question_detail)
+        if checkpoint_path:
+            cached[cache_key] = question_detail
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = checkpoint_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"meta": checkpoint_meta, "questions": cached},
+                                            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(checkpoint_path)
     metrics = {route: {recall_key: values[recall_key] / len(examples),
                        "mrr": values["reciprocal_rank"] / len(examples)}
                for route, values in totals.items()}

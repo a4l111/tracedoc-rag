@@ -47,7 +47,8 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def parse_file(source: Path, raw_dir: Path, output_dir: Path, render_pages: bool = False) -> bool:
+def parse_file(source: Path, raw_dir: Path, output_dir: Path, render_pages: bool = False,
+               describe_images: bool = False, ocr_scanned_pages: bool = False) -> bool:
     doc_id = _doc_id(source, raw_dir)
     target = output_dir / doc_id
     images_dir = target / "images"
@@ -67,7 +68,7 @@ def parse_file(source: Path, raw_dir: Path, output_dir: Path, render_pages: bool
         manifest["sha256"] = _sha256(source)
         suffix = source.suffix.lower()
         if suffix == ".pdf":
-            markdown = _parse_pdf(source, images_dir, manifest, render_pages)
+            markdown = _parse_pdf(source, images_dir, manifest, render_pages, ocr_scanned_pages)
         elif suffix == ".docx":
             markdown = _parse_docx(source, images_dir, manifest)
         elif suffix == ".pptx":
@@ -78,6 +79,9 @@ def parse_file(source: Path, raw_dir: Path, output_dir: Path, render_pages: bool
             markdown = _parse_image(source, images_dir, manifest)
         else:
             raise ValueError(f"Unsupported file type: {suffix}")
+        if describe_images and manifest["image_assets"]:
+            from src.parser.vision import enrich_assets
+            markdown = enrich_assets(markdown, target, manifest)
         (target / "document.md").write_text(markdown, encoding="utf-8")
         return True
     except Exception as exc:
@@ -93,7 +97,8 @@ def parse_file(source: Path, raw_dir: Path, output_dir: Path, render_pages: bool
         _write_json(target / "manifest.json", manifest)
 
 
-def _parse_pdf(source: Path, images_dir: Path, manifest: dict[str, Any], render_pages: bool) -> str:
+def _parse_pdf(source: Path, images_dir: Path, manifest: dict[str, Any], render_pages: bool,
+               ocr_scanned_pages: bool = False) -> str:
     sections = []
     with fitz.open(source) as pdf:
         for number, page in enumerate(pdf, start=1):
@@ -141,13 +146,24 @@ def _parse_pdf(source: Path, images_dir: Path, manifest: dict[str, Any], render_
                                                  "path": path, "page": number, "kind": "embedded",
                                                  "xref": xref, "nearby_text": nearby, "caption": None})
                 lines.append(f"![PDF image {number}.{index}]({path})")
-            if render_pages:
+            if render_pages or (ocr_scanned_pages and not page_text.strip()):
                 filename = f"page-{number:04d}.png"
-                page.get_pixmap().save(images_dir / filename)
+                page.get_pixmap(matrix=fitz.Matrix(2, 2) if ocr_scanned_pages and not page_text.strip()
+                                else fitz.Matrix(1, 1)).save(images_dir / filename)
                 manifest["image_assets"].append({"asset_id": f"page-{number:04d}-render",
                                                  "source_doc_id": manifest["doc_id"],
                                                  "path": f"images/{filename}", "page": number,
                                                  "kind": "page_render", "nearby_text": "", "caption": None})
+                if ocr_scanned_pages and not page_text.strip():
+                    lines.append(f"![PDF page {number} OCR source](images/{filename})")
+                    ocr = _ocr_text(images_dir / filename, manifest)
+                    manifest["image_assets"][-1]["ocr_character_count"] = len(ocr)
+                    if ocr:
+                        lines.append(f"<!-- OCR:local page={number} review_status=unreviewed "
+                                     f"image=images/{filename} -->\n{ocr}")
+                    else:
+                        manifest["errors"].append({"file": str(source), "page": number,
+                                                   "type": "OCRNoText", "message": "Scanned page OCR returned no text"})
             sections.append("\n\n".join(part for part in lines if part))
     return "\n\n".join(sections) + "\n"
 
