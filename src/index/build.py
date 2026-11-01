@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.progress import track
 
 from src.chunker.chunks import make_chunks
+from src.index import visual
 from src.utils import moark
 
 MODELS = {
@@ -58,6 +59,71 @@ def _load_chunks(parsed_dir: Path, mode: str) -> tuple[list[dict[str, Any]], lis
             markdown_path = manifest_path.parent / "document.md"
             markdown = markdown_path.read_text(encoding="utf-8")
             file_chunks = make_chunks(markdown, manifest, mode)
+            for observation in manifest.get("photo_inventory", []):
+                photos = observation.get("photos", [])
+                if not photos:
+                    continue
+                page = observation["page"]
+                details = "; ".join(
+                    f"photo {photo['photo_number']}: {photo['people_count'] if photo['people_count'] is not None else 'unknown'} "
+                    f"{'estimated' if photo['estimated'] else 'observed'} people, "
+                    f"single person {photo['people_count'] == 1 and not photo['estimated']}"
+                    for photo in photos)
+                text = (f"Photo inventory, page {page}, source asset {observation['asset_id']}; "
+                        f"model generated and unreviewed. {details}")
+                chunk_id = hashlib.sha256(
+                    f"{manifest['doc_id']}\0photo-inventory\0{page}\0{text}".encode("utf-8")
+                ).hexdigest()[:24]
+                file_chunks.append({"chunk_id": chunk_id,
+                                    "display_name": f"{Path(manifest['source_file']).name} · photos · page {page}",
+                                    "doc_id": manifest["doc_id"], "text": text,
+                                    "page_start": page, "page_end": page,
+                                    "slide_start": None, "slide_end": None,
+                                    "heading_path": ["Photo inventory"],
+                                    "image_asset_id": observation["asset_id"],
+                                    "review_status": "unreviewed"})
+            observations = manifest.get("photo_inventory", [])
+            expected_photo_pages = sum(asset.get("kind") == "page_render_for_vision"
+                                       for asset in manifest.get("image_assets", []))
+            inventory_complete = len(observations) == expected_photo_pages and all(
+                photo.get("people_count") is not None
+                for entry in observations for photo in entry.get("photos", []))
+            singles = [(entry["page"], photo["photo_number"], entry["asset_id"])
+                       for entry in observations for photo in entry.get("photos", [])
+                       if photo.get("people_count") == 1 and not photo.get("estimated")]
+            counts = [(photo["people_count"], entry["page"], photo["photo_number"],
+                       entry["asset_id"], photo.get("estimated", False))
+                      for entry in observations for photo in entry.get("photos", [])
+                      if photo.get("people_count") is not None]
+            summaries = []
+            if inventory_complete and singles:
+                references = ", ".join(f"page {page} photo {number}" for page, number, _ in singles)
+                summaries.append(("Single-person photos", sorted({page for page, _, _ in singles}),
+                                  [asset for _, _, asset in singles],
+                                  f"Across all photographs in this document, {len(singles)} photos contain "
+                                  f"exactly one visible person: {references}. Model-generated photo counts; "
+                                  "not manually reviewed."))
+            if inventory_complete and counts:
+                winner = max(counts)
+                if sum(count == winner[0] for count, *_ in counts) == 1:
+                    count, page, number, asset, estimated = winner
+                    summaries.append(("Most people in a photo", [page], [asset],
+                                      f"Across all photographs in this document, the photo with the most "
+                                      f"visible people is on page {page}, photo {number}: "
+                                      f"{count} {'estimated' if estimated else 'observed'} people. "
+                                      "Model-generated photo count; not manually reviewed."))
+            for title, pages, assets, text in summaries:
+                chunk_id = hashlib.sha256(
+                    f"{manifest['doc_id']}\0photo-summary\0{title}\0{text}".encode("utf-8")
+                ).hexdigest()[:24]
+                file_chunks.append({"chunk_id": chunk_id,
+                                    "display_name": f"{Path(manifest['source_file']).name} · {title}",
+                                    "doc_id": manifest["doc_id"], "text": text,
+                                    "page_start": None, "page_end": None,
+                                    "slide_start": None, "slide_end": None,
+                                    "heading_path": ["Photo inventory", title],
+                                    "evidence_pages": pages, "image_asset_ids": assets,
+                                    "review_status": "unreviewed"})
             chunks.extend(file_chunks)
             sources.append({"doc_id": manifest["doc_id"], "sha256": manifest["sha256"],
                             "source_file": manifest["source_file"],
@@ -154,34 +220,91 @@ def build(parsed_dir: Path, indexes_dir: Path, mode: str = "structured", downloa
         raise ValueError("No usable chunks found in parsed artifacts")
     if on_progress:
         on_progress("chunking", len(chunks), len(chunks), len(errors))
-    chunk_bytes = b"".join((json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8") for chunk in chunks)
+    attempted_count = len(chunks)
+    routes = {}
+    for route in MODELS:
+        routes[route] = _build_vector_index(folder, route, chunks, snapshot_id,
+                                            "", errors, download_models, on_progress)
+    metadata = {route: json.loads((folder / MODELS[route][3]).read_text(encoding="utf-8"))
+                for route in MODELS}
+    successful_ids = {route: set(meta["chunk_ids"]) for route, meta in metadata.items()}
+    common_ids = set.intersection(*successful_ids.values())
+    usable_chunks = [chunk for chunk in chunks if chunk["chunk_id"] in common_ids]
+    if not usable_chunks:
+        errors.append({"stage": "alignment", "type": "NoCommonChunks",
+                       "message": "No chunk has valid embeddings in every vector route"})
+    chunk_bytes = b"".join((json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+                           for chunk in usable_chunks)
     (folder / "chunks.jsonl").write_bytes(chunk_bytes)
     chunks_sha256 = hashlib.sha256(chunk_bytes).hexdigest()
+    aligned_ids = [chunk["chunk_id"] for chunk in usable_chunks]
+    repair_records = []
+    for route, meta in metadata.items():
+        _, dimension, index_name, meta_name = MODELS[route]
+        old_ids = meta["chunk_ids"]
+        positions = {chunk_id: position for position, chunk_id in enumerate(old_ids)}
+        old_index = faiss.read_index(str(folder / index_name))
+        aligned_index = faiss.IndexFlatIP(dimension)
+        for chunk_id in aligned_ids:
+            aligned_index.add(old_index.reconstruct(positions[chunk_id]).reshape(1, dimension))
+        faiss.write_index(aligned_index, str(folder / index_name))
+        meta.update({"chunks_sha256": chunks_sha256, "chunk_ids": aligned_ids,
+                     "indexed_count": len(aligned_ids), "failed_count": attempted_count - len(aligned_ids)})
+        _write_json(folder / meta_name, meta)
+        routes[route].update({"indexed_count": len(aligned_ids),
+                              "failed_count": attempted_count - len(aligned_ids)})
+    for chunk in chunks:
+        if chunk["chunk_id"] not in common_ids:
+            repair_records.append({"chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"],
+                                   "failed_routes": [route for route, ids in successful_ids.items()
+                                                     if chunk["chunk_id"] not in ids],
+                                   "action": "excluded_from_all_indexes",
+                                   "result": "three_route_alignment_preserved"})
+    for error in errors:
+        if error.get("stage") == "chunking":
+            repair_records.append({"file": error.get("file"), "failed_stage": "chunking",
+                                   "action": "skipped_source_for_this_snapshot",
+                                   "result": "other_sources_continue"})
+    with (folder / "repair_log.jsonl").open("w", encoding="utf-8") as stream:
+        for record in repair_records:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    visual_result: dict[str, Any] | None = None
+    try:
+        visual_result = visual.build_visual_index(parsed_dir, folder, on_progress)
+    except Exception as exc:
+        visual_result = {"failed": True, "error": f"{type(exc).__name__}: {exc}"}
+        errors.append({"stage": "visual", "type": type(exc).__name__, "message": str(exc)})
     snapshot = {"snapshot_id": snapshot_id, "created_at": datetime.now(timezone.utc).isoformat(),
-                "chunk_mode": mode, "chunk_count": len(chunks), "chunks_sha256": chunks_sha256,
+                "chunk_mode": mode, "chunk_count": len(usable_chunks), "attempted_chunk_count": attempted_count,
+                "excluded_chunk_count": attempted_count - len(usable_chunks), "chunks_sha256": chunks_sha256,
                 "sources": sources,
                 "model_config": {"dense": {"provider": "moark", "model": moark.MODEL,
                                            "dimension": moark.DIMENSION, "base_url": moark.BASE_URL},
-                                 "reranker": {"provider": "moark", "model": moark.RERANK_MODEL}}}
+                                 "reranker": {"provider": "moark", "model": moark.RERANK_MODEL},
+                                 "visual_embedding": {"provider": "moark", "model": visual.VISUAL_MODEL,
+                                                      "dimension": visual.DIMENSION}}}
     _write_json(folder / "snapshot.json", snapshot)
-
-    tokens = [tokenize(chunk["text"]) for chunk in track(chunks, description="Tokenizing BM25", console=Console())]
+    if usable_chunks:
+        tokens = [tokenize(chunk["text"]) for chunk in track(usable_chunks, description="Tokenizing BM25", console=Console())]
+        bm25 = BM25Okapi(tokens)
+        with (folder / "bm25.pkl").open("wb") as stream:
+            pickle.dump({"snapshot_id": snapshot_id, "chunks_sha256": chunks_sha256,
+                         "chunk_ids": aligned_ids, "bm25": bm25}, stream)
     if on_progress:
-        on_progress("bm25", len(chunks), len(chunks), len(errors))
-    bm25 = BM25Okapi(tokens)
-    with (folder / "bm25.pkl").open("wb") as stream:
-        pickle.dump({"snapshot_id": snapshot_id, "chunks_sha256": chunks_sha256,
-                     "chunk_ids": [chunk["chunk_id"] for chunk in chunks], "bm25": bm25}, stream)
-
-    routes = {"bm25": {"indexed_count": len(chunks), "failed_count": 0}}
-    for route in MODELS:
-        routes[route] = _build_vector_index(folder, route, chunks, snapshot_id,
-                                            chunks_sha256, errors, download_models, on_progress)
+        on_progress("bm25", len(usable_chunks), len(usable_chunks), len(errors))
+    routes["bm25"] = {"indexed_count": len(usable_chunks),
+                      "failed_count": attempted_count - len(usable_chunks)}
     with (folder / "errors.jsonl").open("w", encoding="utf-8") as stream:
         for error in errors:
             stream.write(json.dumps(error, ensure_ascii=False) + "\n")
-    _write_json(folder / "build_report.json", {"snapshot_id": snapshot_id, "chunk_count": len(chunks),
+    _write_json(folder / "build_report.json", {"snapshot_id": snapshot_id, "chunk_count": len(usable_chunks),
+                                                "attempted_chunk_count": attempted_count,
+                                                "excluded_chunk_count": attempted_count - len(usable_chunks),
                                                 "chunk_mode": mode, "routes": routes,
+                                                "visual": visual_result,
                                                 "error_count": len(errors),
-                                                "complete": all(routes[name]["indexed_count"] == len(chunks) for name in routes)})
+                                                "partial": bool(errors or repair_records),
+                                                "complete": bool(usable_chunks) and all(
+                                                    routes[name]["indexed_count"] == len(usable_chunks)
+                                                    for name in routes)})
     return folder

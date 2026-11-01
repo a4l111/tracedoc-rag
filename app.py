@@ -33,7 +33,7 @@ def parse(
     describe_images: bool = typer.Option(False, help="Send extracted images to MoArk Qwen3-VL."),
     ocr_scanned_pages: bool = typer.Option(False, help="Run local OCR on PDF pages with no native text; results are unreviewed."),
 ) -> None:
-    """Parse PDF, DOCX, PPTX, TXT and image files under data/raw/."""
+    """Parse PDF, DOCX, PPTX, XLSX, TXT and image files under data/raw/."""
     if not raw_dir.is_dir():
         console.print(f"[red]Input directory does not exist:[/red] {raw_dir}")
         raise typer.Exit(code=1)
@@ -85,6 +85,9 @@ def build(
     report = json.loads((folder / "build_report.json").read_text(encoding="utf-8"))
     for route, result in report["routes"].items():
         console.print(f"{route}: {result['indexed_count']}/{report['chunk_count']} chunks indexed")
+    if report.get("excluded_chunk_count"):
+        console.print(f"[yellow]Excluded {report['excluded_chunk_count']} chunks from all three routes; "
+                      "see errors.jsonl and repair_log.jsonl.[/yellow]")
     if not report["complete"]:
         console.print("[yellow]Build is partial; inspect build_report.json and errors.jsonl.[/yellow]")
 
@@ -380,17 +383,43 @@ def describe_mmlongbench(
     parsed_dir: Path = typer.Option(Path("data/benchmarks/mmlongbench/parsed"), help="Original parsed artifacts."),
     gold_path: Path = typer.Option(Path("data/benchmarks/mmlongbench/gold.jsonl"), help="Human evidence-page labels."),
     output_dir: Path = typer.Option(Path("data/benchmarks/mmlongbench/parsed_vision"), help="New enriched artifacts."),
-    max_pages: int | None = typer.Option(None, min=1, help="Optional pilot limit for unique evidence pages."),
+    max_pages: int | None = typer.Option(None, min=1, help="Optional pilot limit for selected pages."),
+    all_pages: bool = typer.Option(False, help="Describe every PDF page without selecting from Gold labels."),
 ) -> None:
-    """Describe labeled evidence pages with MoArk Qwen3-VL in a new parsed directory."""
+    """Describe benchmark PDF pages with MoArk Qwen3-VL in a new parsed directory."""
     from src.parser.vision import enrich_mmlongbench
 
     try:
-        report = enrich_mmlongbench(source_dir, parsed_dir, gold_path, output_dir, max_pages=max_pages)
+        report = enrich_mmlongbench(source_dir, parsed_dir, gold_path, output_dir,
+                                    max_pages=max_pages, all_pages=all_pages)
     except (ValueError, FileNotFoundError, OSError, APIError) as exc:
         console.print(f"[red]Vision enrichment failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(f"Vision pages: {report['described_pages']}/{report['requested_pages']}; "
+                  f"failed: {report['failed_pages']}; output: {output_dir}")
+
+
+@app.command(name="inventory-photos")
+def inventory_photos(
+    parsed_dir: Path = typer.Option(Path("data/benchmarks/mmlongbench/parsed_vision_all"),
+                                    help="Parsed artifacts containing saved page render images."),
+    output_dir: Path = typer.Option(Path("data/benchmarks/mmlongbench/parsed_photo_inventory"),
+                                    help="New parsed directory with photo observations."),
+) -> None:
+    """Count visible people in photos from saved page images, without reparsing PDFs."""
+    from rich.progress import Progress
+    from src.parser.photo_inventory import inventory_parsed
+
+    try:
+        with Progress(console=console) as progress:
+            task = progress.add_task("Inspecting page photos", total=None)
+            def update(completed: int, total: int) -> None:
+                progress.update(task, completed=completed, total=total)
+            report = inventory_parsed(parsed_dir, output_dir, on_progress=update)
+    except (ValueError, FileNotFoundError, OSError, APIError) as exc:
+        console.print(f"[red]Photo inventory failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Photo pages: {report['completed_pages']}/{report['requested_pages']}; "
                   f"failed: {report['failed_pages']}; output: {output_dir}")
 
 

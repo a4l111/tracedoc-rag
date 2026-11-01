@@ -16,6 +16,25 @@ from src.parser.tables import docx_table
 
 
 class TableParsingTests(unittest.TestCase):
+    def test_pdf_markers_count_physical_pages(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            root = Path(temp)
+            raw = root / "raw"
+            raw.mkdir()
+            document = fitz.open()
+            document.new_page().insert_text((72, 72), "Printed page 7")
+            document.new_page().insert_text((72, 72), "Printed page 8")
+            document.save(raw / "pages.pdf")
+            document.close()
+            self.assertTrue(parse_file(raw / "pages.pdf", raw, root / "parsed"))
+            folder = next((root / "parsed").iterdir())
+            markdown = (folder / "document.md").read_text(encoding="utf-8")
+            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            self.assertIn("<!-- PAGE:1 -->", markdown)
+            self.assertIn("<!-- PAGE:2 -->", markdown)
+            self.assertNotIn("<!-- PAGE:7 -->", markdown)
+            self.assertEqual([item["page"] for item in manifest["page_map"]], [1, 2])
+
     def test_image_only_pdf_ocr_is_opt_in_and_marked_unreviewed(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
             root = Path(temp)

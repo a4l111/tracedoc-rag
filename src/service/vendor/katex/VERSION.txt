@@ -1,0 +1,1 @@
+KaTeX 0.19.1; npm registry package integrity verified. https://katex.org

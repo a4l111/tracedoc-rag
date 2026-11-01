@@ -1,5 +1,6 @@
 """Local document parsing and per-file output management."""
 
+import csv as _csv
 import hashlib
 import json
 import posixpath
@@ -7,7 +8,7 @@ import re
 import traceback
 import zipfile
 from functools import lru_cache
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -15,14 +16,15 @@ from xml.etree import ElementTree
 import fitz
 from charset_normalizer import from_bytes
 from PIL import Image, UnidentifiedImageError
+from openpyxl import load_workbook
 from rapidocr_onnxruntime import RapidOCR
 
 from src.parser.tables import docx_table, markdown_table
 from src.parser.pptx import parse_pptx
 
 
-EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
-IMAGE_EXTENSIONS = EXTENSIONS - {".pdf", ".docx", ".pptx", ".txt"}
+EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+IMAGE_EXTENSIONS = EXTENSIONS - {".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt"}
 
 
 def supported_files(raw_dir: Path) -> list[Path]:
@@ -73,12 +75,18 @@ def parse_file(source: Path, raw_dir: Path, output_dir: Path, render_pages: bool
             markdown = _parse_docx(source, images_dir, manifest)
         elif suffix == ".pptx":
             markdown = parse_pptx(source, images_dir, manifest, _ocr_text)
+        elif suffix == ".xlsx":
+            markdown = _parse_xlsx(source, manifest)
+        elif suffix == ".csv":
+            markdown = _parse_csv(source, manifest)
         elif suffix == ".txt":
             markdown = _parse_txt(source, manifest)
         elif suffix in IMAGE_EXTENSIONS:
             markdown = _parse_image(source, images_dir, manifest)
         else:
             raise ValueError(f"Unsupported file type: {suffix}")
+        if suffix in {".xlsx", ".csv"}:
+            _write_spreadsheet_snapshot(source, target, manifest)
         if describe_images and manifest["image_assets"]:
             from src.parser.vision import enrich_assets
             markdown = enrich_assets(markdown, target, manifest)
@@ -166,6 +174,98 @@ def _parse_pdf(source: Path, images_dir: Path, manifest: dict[str, Any], render_
                                                    "type": "OCRNoText", "message": "Scanned page OCR returned no text"})
             sections.append("\n\n".join(part for part in lines if part))
     return "\n\n".join(sections) + "\n"
+
+
+def _parse_xlsx(source: Path, manifest: dict[str, Any]) -> str:
+    """Read cached cell values without running formulas or following external links."""
+    workbook = load_workbook(source, read_only=True, data_only=True, keep_links=False)
+    sections: list[str] = []
+    manifest["sheets"] = []
+    try:
+        for sheet in workbook:
+            rows: list[str] = [f"# 工作表：{sheet.title}"]
+            included = 0
+            max_row = sheet.max_row or 5000
+            max_column = sheet.max_column or 100
+            for row_number, cells in enumerate(sheet.iter_rows(max_row=min(max_row, 5000),
+                                                                  max_col=min(max_column, 100)), 1):
+                values = [str(cell.value).replace("|", "\\|").replace("\n", "<br>")
+                          if cell.value is not None else "" for cell in cells]
+                if any(values):
+                    while values and not values[-1]:
+                        values.pop()
+                    rows.append(f"行 {row_number}：" + " | ".join(values))
+                    included += 1
+            manifest["sheets"].append({"name": sheet.title, "rows_with_values": included,
+                                       "max_row": sheet.max_row, "max_column": sheet.max_column})
+            if max_row > 5000 or max_column > 100:
+                manifest["errors"].append({"file": str(source), "sheet": sheet.title,
+                                           "type": "XlsxLimit", "message": "Only first 5000 rows and 100 columns parsed"})
+            sections.append("\n".join(rows))
+    finally:
+        workbook.close()
+    return "\n\n".join(sections) + "\n"
+
+
+def _write_spreadsheet_snapshot(source: Path, target: Path, manifest: dict[str, Any]) -> None:
+    """Persist a cell-level spreadsheet.json for table browse and bounded compute.
+
+    A snapshot failure is recorded as a non-fatal error so Markdown parsing still
+    succeeds even when the structured table model cannot be built.
+    """
+    try:
+        from src.parser import spreadsheet
+        sheets, warnings = spreadsheet.read_xlsx(source) if source.suffix.lower() == ".xlsx" \
+            else spreadsheet.read_csv(source)
+        spreadsheet.write_artifact(target, source, manifest["sha256"], sheets, warnings)
+        manifest["spreadsheet"] = {"sheets": len(sheets),
+                                   "cells": sum(len(row["cells"]) for sheet in sheets for row in sheet["rows"])}
+        for warning in warnings:
+            manifest["errors"].append({"file": str(source), "type": "SpreadsheetWarning", "message": warning})
+    except Exception as exc:
+        manifest["errors"].append({"file": str(source), "type": type(exc).__name__,
+                                   "message": f"Spreadsheet snapshot failed: {exc}"})
+
+
+def _parse_csv(source: Path, manifest: dict[str, Any]) -> str:
+    """Read delimited text as a Markdown table, preserving leading zeros and text.
+
+    Encoding follows a deterministic order: UTF-16 when a BOM is present, else
+    UTF-8 (with optional BOM), falling back to GB18030. Field content is never
+    evaluated, so values that start with ``=`` stay literal text.
+    """
+    raw = source.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-8-sig"
+    try:
+        content = raw.decode(encoding)
+    except UnicodeDecodeError:
+        content = raw.decode("gb18030")
+        encoding = "gb18030"
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    manifest["encoding"] = encoding
+    manifest["character_count"] = len(content)
+    lines = content.splitlines()
+    sample = "\n".join(lines[:5])
+    try:
+        delimiter = _csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except _csv.Error:
+        delimiter = ","
+    rows = [[cell or "" for cell in row] for row in _csv.reader(lines, delimiter=delimiter)]
+    rows = [row for row in rows if any(row)]
+    max_rows, max_cols = 5000, 100
+    truncated = len(rows) > max_rows or any(len(row) > max_cols for row in rows)
+    rows = [row[:max_cols] for row in rows[:max_rows]]
+    manifest["csv"] = {"rows_with_values": len(rows), "columns": max((len(row) for row in rows), default=0),
+                       "delimiter": delimiter}
+    if truncated:
+        manifest["errors"].append({"file": str(source), "type": "CsvLimit",
+                                   "message": "Only first 5000 rows and 100 columns parsed"})
+    if not rows:
+        return ""
+    return f"# CSV 数据：{source.stem}\n\n{markdown_table(rows)}\n"
 
 
 @lru_cache(maxsize=1)

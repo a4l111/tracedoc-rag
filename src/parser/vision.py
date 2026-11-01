@@ -1,4 +1,4 @@
-"""MoArk visual descriptions for benchmark evidence pages."""
+"""MoArk visual descriptions for document pages."""
 
 import base64
 import json
@@ -100,25 +100,33 @@ def _page_text(markdown: str, page: int) -> str:
     return following[:end.start() if end else None]
 
 
-def enrich_mmlongbench(source_dir: Path, parsed_dir: Path, gold_path: Path, output_dir: Path,
+def enrich_mmlongbench(source_dir: Path, parsed_dir: Path, gold_path: Path | None, output_dir: Path,
                        max_pages: int | None = None, model: str = VISION_MODEL,
-                       client: OpenAI | None = None) -> dict:
-    """Copy parsed artifacts and add model-labeled page renders at gold locations."""
+                       client: OpenAI | None = None, all_pages: bool = False) -> dict:
+    """Copy parsed artifacts and describe every page for unbiased evaluation."""
     if output_dir.exists():
         raise ValueError(f"Output already exists: {output_dir}")
     documents = source_dir / "data" / "documents"
-    if not documents.is_dir() or not parsed_dir.is_dir() or not gold_path.is_file():
+    if not documents.is_dir() or not parsed_dir.is_dir() or (not all_pages and
+            (gold_path is None or not gold_path.is_file())):
         raise ValueError("Benchmark documents, parsed artifacts, or gold labels are missing")
     locations = []
     seen = set()
-    for line in gold_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        for label in json.loads(line)["relevant"]:
-            location = (label["doc_id"], int(label["page"]))
-            if location not in seen:
-                locations.append(location)
-                seen.add(location)
+    if all_pages:
+        for manifest_path in sorted(parsed_dir.glob("*/manifest.json")):
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            source = documents / manifest["source_file"]
+            with fitz.open(source) as pdf:
+                locations.extend((manifest["doc_id"], page) for page in range(1, len(pdf) + 1))
+    else:
+        for line in gold_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            for label in json.loads(line)["relevant"]:
+                location = (label["doc_id"], int(label["page"]))
+                if location not in seen:
+                    locations.append(location)
+                    seen.add(location)
     if max_pages is not None:
         locations = locations[:max_pages]
     shutil.copytree(parsed_dir, output_dir)
@@ -182,6 +190,7 @@ def enrich_mmlongbench(source_dir: Path, parsed_dir: Path, gold_path: Path, outp
             failures.append({"stage": "vision_document", "doc_id": doc_id,
                              "type": type(exc).__name__, "message": str(exc)})
     report = {"provider": "moark", "model": model, "prompt_version": PROMPT_VERSION,
+              "selection": "all_pages" if all_pages else "gold_locations",
               "requested_pages": len(locations), "described_pages": completed,
               "failed_pages": len(failures), "failures": failures,
               "raw_responses_persisted": False, "output_dir": str(output_dir.resolve())}

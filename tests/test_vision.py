@@ -65,6 +65,29 @@ class VisionTests(unittest.TestCase):
             self.assertFalse(vision["raw_response_persisted"])
             self.assertEqual(vision["review_status"], "unreviewed")
 
+    def test_all_pages_does_not_need_gold_locations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            documents = root / "benchmark" / "data" / "documents"
+            documents.mkdir(parents=True)
+            source = documents / "sample.pdf"
+            pdf = fitz.open()
+            pdf.new_page().insert_text((40, 40), "First page")
+            pdf.new_page().insert_text((40, 40), "Second page")
+            pdf.save(source)
+            pdf.close()
+            parsed = root / "parsed"
+            self.assertTrue(parse_file(source, documents, parsed))
+            output = root / "vision_all"
+            report = enrich_mmlongbench(root / "benchmark", parsed, None, output,
+                                        client=_Client(), all_pages=True)
+            self.assertEqual(report["selection"], "all_pages")
+            self.assertEqual(report["requested_pages"], 2)
+            self.assertEqual(report["described_pages"], 2)
+            markdown = next(output.glob("*/document.md")).read_text(encoding="utf-8")
+            self.assertIn("asset_id=page-0001-vision-render", markdown)
+            self.assertIn("asset_id=page-0002-vision-render", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

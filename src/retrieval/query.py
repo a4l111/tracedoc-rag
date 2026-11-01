@@ -140,9 +140,23 @@ def fuse_and_rerank(question: str, rankings: dict[str, list[dict]],
     return [{**item["chunk"], "score": float(score)} for item, score in ranked[:5]]
 
 
+_TECH_TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
+
+
+def _technical_terms(question: str) -> str:
+    """Extract ASCII technical/English terms for a conservative re-query."""
+    terms = " ".join(_TECH_TERM_RE.findall(question)).strip()
+    return terms if terms and terms != question.strip() else ""
+
+
 def query(indexes_dir: Path, snapshot_id: str, question: str,
-          on_step: Callable[[str], None] | None = None) -> list[dict]:
-    """Retrieve 20 per route, fuse 50 by RRF, and rerank to five."""
+          on_step: Callable[[str], None] | None = None, expand: bool = True) -> list[dict]:
+    """Retrieve 20 per route, fuse 50 by RRF, and rerank to five.
+
+    When the first pass returns fewer than two chunks, conservatively re-query
+    with the technical/English terms extracted from the question and merge any
+    new chunks. Original terms are always retained and no terms are invented.
+    """
     if not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}", snapshot_id):
         raise ValueError("Invalid snapshot_id")
     if not question.strip():
@@ -160,4 +174,16 @@ def query(indexes_dir: Path, snapshot_id: str, question: str,
         if on_step:
             on_step(f"Searching {route}")
         rankings[route] = search(indexes_dir, snapshot_id, route, question, top_k=20)
-    return fuse_and_rerank(question, rankings, on_step)
+    hits = fuse_and_rerank(question, rankings, on_step)
+    if expand and len(hits) < 2:
+        technical = _technical_terms(question)
+        if technical:
+            if on_step:
+                on_step("Expanding query with technical terms")
+            extra_rankings = {}
+            for route in ROUTES:
+                extra_rankings[route] = search(indexes_dir, snapshot_id, route, technical, top_k=20)
+            extra = fuse_and_rerank(technical, extra_rankings, on_step)
+            known = {chunk["chunk_id"] for chunk in hits}
+            hits = (hits + [chunk for chunk in extra if chunk["chunk_id"] not in known])[:5]
+    return hits

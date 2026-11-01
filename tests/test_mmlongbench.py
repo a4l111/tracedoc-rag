@@ -31,10 +31,11 @@ class MMLongBenchTests(unittest.TestCase):
             self.assertEqual(result["answerable_questions"], 1)
             self.assertEqual(result["unanswerable_questions"], 1)
             self.assertEqual(len(result["invalid_labels"]), 1)
-            self.assertIn("one-based", result["invalid_labels"][0]["reason"])
+            self.assertIn("cannot be mapped", result["invalid_labels"][0]["reason"])
             gold = json.loads((root / "output" / "gold.jsonl").read_text(encoding="utf-8"))
             self.assertEqual(gold["relevant"][0]["page"], 1)
-            self.assertEqual(result["page_rule"], "benchmark one-based evidence_pages = parser PAGE:n")
+            self.assertEqual(gold["evidence_pages_raw"], "[1]")
+            self.assertIn("retained unchanged", result["page_rule"])
             self.assertEqual(result["parsed_documents"], 1)
 
 

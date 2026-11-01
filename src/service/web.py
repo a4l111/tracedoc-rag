@@ -11,12 +11,16 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.index.build import build as build_snapshot
+from src.index.visual import visual_search
 from src.parser.pipeline import EXTENSIONS, parse_file, supported_files
-from src.qa.answer import answer_question
+from src.parser.ppt_structure import preview as ppt_structure_preview
+from src.parser.spreadsheet import snapshot as spreadsheet_snapshot
+from src.qa import diagram, table_compute
+from src.qa.answer import CancelToken, GenerationCancelled, answer_question, stream_answer
 from src.retrieval.query import latest_complete_snapshot, query as retrieve
 from src.service.conversations import Conversations
 from src.utils.model_settings import DEFAULTS, delete_secret, public_settings, save_role, set_secret
@@ -35,6 +39,8 @@ CATEGORIES = SERVICE / "categories.json"
 MAX_UPLOAD = 50 * 1024 * 1024
 executor = ThreadPoolExecutor(max_workers=1)
 lock = threading.Lock()
+_streams_lock = threading.Lock()
+_active_streams: dict[str, CancelToken] = {}
 app = FastAPI(title="Multimodal RAG LAN")
 
 
@@ -74,12 +80,13 @@ def _job(job_id: str, **changes) -> dict:
     return record
 
 
-def _new_job(kind: str, retry: dict | None = None) -> str:
+def _new_job(kind: str, retry: dict | None = None, retried_from: str | None = None) -> str:
     job_id = uuid.uuid4().hex
     _write_json(JOBS / f"{job_id}.json", {
         "job_id": job_id, "kind": kind, "state": "queued", "stage": "排队中",
         "completed": 0, "total": None, "errors": 0,
         "retry": retry,
+        "retried_from": retried_from,
         "created_at": _now(), "updated_at": _now(),
     })
     return job_id
@@ -142,7 +149,7 @@ def _build_job(job_id: str, mode: str) -> None:
         _job(job_id, stage=stages.get(stage, stage), completed=completed, total=total, errors=errors)
     folder = build_snapshot(PARSED, INDEXES, mode, False, on_progress=progress)
     report = json.loads((folder / "build_report.json").read_text(encoding="utf-8"))
-    _job(job_id, state="completed" if report["complete"] else "partial", stage="构建完成",
+    _job(job_id, state="partial" if report.get("partial") else "completed", stage="构建完成",
          snapshot_id=folder.name, completed=report["chunk_count"], total=report["chunk_count"],
          errors=report.get("error_count", 0), report=str(folder / "build_report.json"))
     _event("build", report["complete"])
@@ -173,6 +180,19 @@ def home():
     return (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
 
 
+_VENDOR = (Path(__file__).parent / "vendor").resolve()
+
+
+@app.get("/vendor/{file_path:path}")
+def vendor(file_path: str):
+    target = (_VENDOR / file_path).resolve()
+    if target != _VENDOR and _VENDOR not in target.parents:
+        raise HTTPException(404, "无效资源路径")
+    if not target.is_file():
+        raise HTTPException(404, "资源不存在")
+    return FileResponse(target)
+
+
 @app.get("/api/documents")
 def documents():
     result = []
@@ -183,7 +203,8 @@ def documents():
             result.append({"doc_id": manifest["doc_id"], "source_file": manifest["source_file"],
                            "source_type": manifest["source_type"], "errors": len(manifest.get("errors", [])),
                            "images": len(manifest.get("image_assets", [])),
-                           "category": categories.get(manifest["doc_id"], "未分类")})
+                           "category": categories.get(manifest["doc_id"], "未分类"),
+                           "spreadsheet": (PARSED / manifest["doc_id"] / "spreadsheet.json").is_file()})
         except (OSError, KeyError, ValueError):
             continue
     return result
@@ -303,7 +324,7 @@ def retry_job(job_id: str):
         mode = retry.get("chunk_mode")
         if mode not in {"fixed", "structured"}:
             raise HTTPException(409, "构建重试参数无效")
-        new_id = _new_job("build", retry)
+        new_id = _new_job("build", retry, retried_from=job_id)
         executor.submit(_run, new_id, _build_job, mode)
     elif record.get("kind") == "parse":
         names = retry.get("paths")
@@ -319,7 +340,7 @@ def retry_job(job_id: str):
                 raise HTTPException(409, f"待重试文件不存在：{name}")
             paths.append(candidate)
         describe = bool(retry.get("describe_images", False))
-        new_id = _new_job("parse", retry)
+        new_id = _new_job("parse", retry, retried_from=job_id)
         executor.submit(_run, new_id, _parse_job, paths, describe)
     else:
         raise HTTPException(409, "该任务类型不支持重试")
@@ -358,6 +379,11 @@ class QueryRequest(BaseModel):
     conversation_id: str | None = None
 
 
+class DiagramRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    snapshot_id: str | None = None
+
+
 class ModelSettingsRequest(BaseModel):
     role: str
     provider: str
@@ -393,47 +419,146 @@ def update_model_settings(body: ModelSettingsRequest, request: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _prepare_query(request: QueryRequest) -> dict:
+    """Retrieve the final Top 5 and build hits/history for either answer path."""
+    snapshot_id = request.snapshot_id or latest_complete_snapshot(INDEXES)
+    if not snapshot_id.replace("-", "").isalnum():
+        raise ValueError("无效 snapshot ID")
+    conversations = Conversations(SERVICE / "conversations.sqlite3")
+    history = conversations.history(request.conversation_id)
+    previous_questions = "\n".join(item["question"] for item in history[-6:])[-8000:]
+    retrieval_question = (previous_questions + "\n当前问题：" + request.question) if previous_questions else request.question
+    chunks = retrieve(INDEXES, snapshot_id, retrieval_question)
+    snapshot = json.loads((INDEXES / snapshot_id / "snapshot.json").read_text(encoding="utf-8"))
+    names = {item["doc_id"]: item["source_file"] for item in snapshot["sources"]}
+    source_hashes = {item["doc_id"]: item.get("sha256") for item in snapshot["sources"]}
+    hits = [{"chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"],
+             "source": names[chunk["doc_id"]], "page_start": chunk["page_start"],
+             "page_end": chunk["page_end"], "slide_start": chunk.get("slide_start"),
+             "slide_end": chunk.get("slide_end"), "heading_path": chunk["heading_path"],
+             "score": chunk["score"], "text": chunk["text"],
+             "images": _assets(chunk["doc_id"], chunk["page_start"], chunk["page_end"],
+                               chunk.get("slide_start"), chunk.get("slide_end"),
+                               source_hashes.get(chunk["doc_id"]))} for chunk in chunks]
+    config_path = ROOT / "config.yaml"
+    if not config_path.is_file():
+        config_path = BUNDLE_ROOT / "config.yaml"
+    visual_hits = []
+    try:
+        for item in visual_search(INDEXES, snapshot_id, request.question, top_k=5):
+            name = Path(item["path"]).name
+            visual_hits.append({"doc_id": item["doc_id"], "page": item.get("page"),
+                                "slide": item.get("slide"), "kind": item.get("kind"),
+                                "score": item.get("score"),
+                                "url": f"/api/source/{item['doc_id']}/images/{name}"})
+    except (ValueError, FileNotFoundError, RuntimeError, OSError):
+        visual_hits = []
+    return {"snapshot_id": snapshot_id, "chunks": chunks, "hits": hits, "visual_hits": visual_hits,
+            "history": history, "config_path": config_path, "conversations": conversations}
+
+
 @app.post("/api/query")
 def query(request: QueryRequest):
     from time import monotonic
     start = monotonic()
     try:
-        snapshot_id = request.snapshot_id or latest_complete_snapshot(INDEXES)
-        if not snapshot_id.replace("-", "").isalnum():
-            raise ValueError("无效 snapshot ID")
-        conversations = Conversations(SERVICE / "conversations.sqlite3")
-        history = conversations.history(request.conversation_id)
-        previous_questions = "\n".join(item["question"] for item in history[-6:])[-8000:]
-        retrieval_question = (previous_questions + "\n当前问题：" + request.question) if previous_questions else request.question
-        chunks = retrieve(INDEXES, snapshot_id, retrieval_question)
-        snapshot = json.loads((INDEXES / snapshot_id / "snapshot.json").read_text(encoding="utf-8"))
-        names = {item["doc_id"]: item["source_file"] for item in snapshot["sources"]}
-        source_hashes = {item["doc_id"]: item.get("sha256") for item in snapshot["sources"]}
-        hits = [{"chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"],
-                 "source": names[chunk["doc_id"]], "page_start": chunk["page_start"],
-                 "page_end": chunk["page_end"], "slide_start": chunk.get("slide_start"),
-                 "slide_end": chunk.get("slide_end"), "heading_path": chunk["heading_path"],
-                 "score": chunk["score"], "text": chunk["text"],
-                 "images": _assets(chunk["doc_id"], chunk["page_start"], chunk["page_end"],
-                                   chunk.get("slide_start"), chunk.get("slide_end"),
-                                   source_hashes.get(chunk["doc_id"]))} for chunk in chunks]
-        config_path = ROOT / "config.yaml"
-        if not config_path.is_file():
-            config_path = BUNDLE_ROOT / "config.yaml"
-        usage: dict[str, int] = {}
-        response = answer_question(INDEXES, snapshot_id, request.question, config_path,
-                                   chunks=chunks, history=history,
-                                   on_usage=usage.update) if request.answer else None
-        conversation_id, turn_id = conversations.append(request.conversation_id, request.question,
-                                                         response or "仅检索，未调用 DeepSeek", snapshot_id, hits)
-        _event("query", True, round((monotonic() - start) * 1000))
-        if usage:
-            _token_event(usage)
-        return {"snapshot_id": snapshot_id, "answer": response, "hits": hits,
-                "conversation_id": conversation_id, "turn_id": turn_id, "usage": usage or None}
+        prepared = _prepare_query(request)
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         _event("query", False, round((monotonic() - start) * 1000))
         raise HTTPException(400, str(exc)) from exc
+    snapshot_id = prepared["snapshot_id"]
+    usage: dict[str, int] = {}
+    response = answer_question(INDEXES, snapshot_id, request.question, prepared["config_path"],
+                               chunks=prepared["chunks"], history=prepared["history"],
+                               on_usage=usage.update) if request.answer else None
+    conversation_id, turn_id = prepared["conversations"].append(
+        request.conversation_id, request.question, response or "仅检索，未调用 DeepSeek",
+        snapshot_id, prepared["hits"])
+    _event("query", True, round((monotonic() - start) * 1000))
+    if usage:
+        _token_event(usage)
+    return {"snapshot_id": snapshot_id, "answer": response, "hits": prepared["hits"],
+            "visual_hits": prepared.get("visual_hits", []),
+            "conversation_id": conversation_id, "turn_id": turn_id, "usage": usage or None}
+
+
+@app.post("/api/query/stream")
+def query_stream(request: QueryRequest):
+    """Stream a DeepSeek answer as server-sent events; stop via the cancel endpoint."""
+    from time import monotonic
+    start = monotonic()
+    if not request.answer:
+        raise HTTPException(400, "流式接口仅用于生成回答")
+    try:
+        prepared = _prepare_query(request)
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        _event("query", False, round((monotonic() - start) * 1000))
+        raise HTTPException(400, str(exc)) from exc
+
+    token = CancelToken()
+    stream_id = uuid.uuid4().hex
+    with _streams_lock:
+        _active_streams[stream_id] = token
+
+    def generate():
+        try:
+            yield "data: " + json.dumps({"stream_id": stream_id, "snapshot_id": prepared["snapshot_id"],
+                                         "hits": prepared["hits"],
+                                         "visual_hits": prepared.get("visual_hits", [])}, ensure_ascii=False) + "\n\n"
+            for event in stream_answer(INDEXES, prepared["snapshot_id"], request.question,
+                                       prepared["config_path"], chunks=prepared["chunks"],
+                                       history=prepared["history"], cancel=token):
+                if event["type"] == "delta":
+                    yield "data: " + json.dumps({"delta": event["text"]}, ensure_ascii=False) + "\n\n"
+                else:
+                    conversation_id, turn_id = prepared["conversations"].append(
+                        request.conversation_id, request.question, event["answer"],
+                        prepared["snapshot_id"], prepared["hits"])
+                    _event("query", True, round((monotonic() - start) * 1000))
+                    yield "data: " + json.dumps({"done": True, "answer": event["answer"],
+                                                 "conversation_id": conversation_id,
+                                                 "turn_id": turn_id}, ensure_ascii=False) + "\n\n"
+        except GenerationCancelled:
+            _event("query", True, round((monotonic() - start) * 1000))
+            yield "data: " + json.dumps({"cancelled": True}, ensure_ascii=False) + "\n\n"
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            _event("query", False, round((monotonic() - start) * 1000))
+            yield "data: " + json.dumps({"error": str(exc)}, ensure_ascii=False) + "\n\n"
+        finally:
+            with _streams_lock:
+                _active_streams.pop(stream_id, None)
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/api/query/stream/{stream_id}/cancel")
+def cancel_stream(stream_id: str):
+    with _streams_lock:
+        token = _active_streams.get(stream_id)
+    if not token:
+        raise HTTPException(404, "流式任务不存在或已结束")
+    token.cancel()
+    return {"cancelled": True}
+
+
+@app.post("/api/diagram")
+def make_diagram(request: DiagramRequest):
+    from time import monotonic
+    snapshot_id = request.snapshot_id or latest_complete_snapshot(INDEXES)
+    if not snapshot_id or not snapshot_id.replace("-", "").isalnum():
+        raise HTTPException(400, "无效 snapshot ID")
+    config_path = ROOT / "config.yaml"
+    if not config_path.is_file():
+        config_path = BUNDLE_ROOT / "config.yaml"
+    start = monotonic()
+    try:
+        result = diagram.generate_diagram(INDEXES, snapshot_id, request.question, config_path,
+                                          on_usage=_token_event)
+    except ValueError as exc:
+        _event("diagram", False, round((monotonic() - start) * 1000))
+        raise HTTPException(400, str(exc)) from exc
+    _event("diagram", True, round((monotonic() - start) * 1000))
+    return result
 
 
 @app.get("/api/source/{doc_id}")
@@ -454,6 +579,119 @@ def source_image(doc_id: str, name: str):
     if not path.is_file():
         raise HTTPException(404, "图片不存在")
     return FileResponse(path)
+
+
+def _ppt_source_path(doc_id: str) -> Path:
+    manifest_path = PARSED / doc_id / "manifest.json"
+    if not manifest_path.is_file():
+        raise HTTPException(404, "文档不存在")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("source_type") != "pptx":
+        raise HTTPException(400, "该文档不是 PPTX，没有幻灯片结构预览")
+    source = (RAW / manifest["source_file"]).resolve()
+    if not source.is_file():
+        raise HTTPException(404, "原始 PPTX 文件已不在 data/raw 中，无法生成结构预览")
+    return source
+
+
+@app.get("/api/source/{doc_id}/ppt-structure/{slide}")
+def ppt_structure(doc_id: str, slide: int):
+    if not doc_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(400, "无效文档 ID")
+    source = _ppt_source_path(doc_id)
+    try:
+        result = ppt_structure_preview(source, slide)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    png = result.pop("png")
+    return {**result, "image_url": f"/api/source/{doc_id}/ppt-structure/{slide}/image",
+            "png_bytes": len(png)}
+
+
+@app.get("/api/source/{doc_id}/ppt-structure/{slide}/image")
+def ppt_structure_image(doc_id: str, slide: int):
+    if not doc_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(400, "无效文档 ID")
+    source = _ppt_source_path(doc_id)
+    try:
+        result = ppt_structure_preview(source, slide)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return Response(content=result["png"], media_type="image/png")
+
+
+@app.get("/api/source/{doc_id}/spreadsheet")
+def spreadsheet(doc_id: str):
+    if not doc_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(400, "无效文档 ID")
+    try:
+        snap = spreadsheet_snapshot(PARSED, doc_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    sheets = []
+    for sheet in snap["sheets"]:
+        rows = sheet["rows"]
+        cap = 500
+        truncated = len(rows) > cap
+        sheets.append({"name": sheet["name"], "header_row": sheet.get("header_row"), "max_row": sheet["max_row"],
+                       "row_count": len(rows), "truncated": truncated,
+                       "rows": [{"number": row["number"], "cells": [
+                           {"column": cell["column"], "address": cell["address"], "display": cell["display"],
+                            "type": cell["type"], "formula": bool(cell["formula"])} for cell in row["cells"]]
+                           } for row in rows[:cap]]})
+    return {"doc_id": doc_id, "name": snap["name"], "sheets": sheets}
+
+
+class TablePlanRequest(BaseModel):
+    question: str
+    doc_id: str
+
+
+class TableExecuteRequest(BaseModel):
+    plan: dict
+    signature: str
+
+
+@app.post("/api/table/plan")
+def table_plan(body: TablePlanRequest):
+    if not body.doc_id.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(400, "无效文档 ID")
+    try:
+        return table_compute.plan(PARSED, body.question, body.doc_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/table/execute")
+def table_execute(body: TableExecuteRequest):
+    try:
+        report = table_compute.execute(PARSED, body.plan, body.signature)
+        return {"answer": table_compute.result_answer(report), "report": report}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/activity")
+def activity():
+    events = []
+    if EVENTS.is_file():
+        for line in EVENTS.read_text(encoding="utf-8").splitlines():
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+    allowed = {"parse", "build", "query", "job", "diagram"}
+    operational = [event for event in events if event.get("kind") in allowed]
+    visible = list(reversed(operational))
+    counts: dict[str, int] = {}
+    for event in operational:
+        key = str(event.get("kind", "unknown"))
+        counts[key] = counts.get(key, 0) + 1
+    return {"events": visible[:100], "counts": counts, "retention": None}
 
 
 @app.get("/api/metrics")

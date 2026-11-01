@@ -7,11 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.qa.answer import answer_question
+from src.qa.answer import CancelToken, GenerationCancelled, answer_question, stream_answer
 
 
 def _response(text: str):
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+
+def _delta(text: str):
+    return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=text))])
 
 
 class AnswerTests(unittest.TestCase):
@@ -74,6 +78,39 @@ class AnswerTests(unittest.TestCase):
                                      chunks=self.chunks)
         self.assertIn("缺少 DEEPSEEK_API_KEY", result)
         client.assert_not_called()
+
+    def test_stream_yields_deltas_then_validated_done(self):
+        completion = Mock()
+        completion.create.return_value = iter([
+            _delta("两个来源给出不同结论："),
+            _delta("[1][2]"),
+        ])
+        client = Mock()
+        client.chat.completions = completion
+        with patch("src.qa.answer.get_api_key", return_value="test-key"), \
+             patch("src.qa.answer.OpenAI", return_value=client):
+            events = list(stream_answer(self.root, self.snapshot_id, "结论是什么？",
+                                        self.root / "config.yaml", chunks=self.chunks))
+        deltas = [event for event in events if event["type"] == "delta"]
+        done = [event for event in events if event["type"] == "done"]
+        self.assertEqual([event["text"] for event in deltas], ["两个来源给出不同结论：", "[1][2]"])
+        self.assertEqual(len(done), 1)
+        self.assertIn("[1] a.pdf，第1页", done[0]["answer"])
+        self.assertIn("[2] b.pdf，第2页", done[0]["answer"])
+        self.assertFalse(done[0]["fallback"])
+
+    def test_stream_cancel_stops_generation(self):
+        token = CancelToken()
+        token.cancel()
+        completion = Mock()
+        completion.create.return_value = iter([_delta("不应到达的内容[1]")])
+        client = Mock()
+        client.chat.completions = completion
+        with patch("src.qa.answer.get_api_key", return_value="test-key"), \
+             patch("src.qa.answer.OpenAI", return_value=client):
+            with self.assertRaises(GenerationCancelled):
+                list(stream_answer(self.root, self.snapshot_id, "结论是什么？",
+                                   self.root / "config.yaml", chunks=self.chunks, cancel=token))
 
 
 if __name__ == "__main__":

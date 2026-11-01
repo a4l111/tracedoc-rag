@@ -32,7 +32,8 @@ def _relevant_ids(chunks: list[dict], labels: list[dict]) -> set[str]:
             slide = label.get("slide")
             found.update(chunk["chunk_id"] for chunk in chunks
                          if chunk["doc_id"] == label["doc_id"]
-                         and (page is None or chunk["page_start"] is not None
+                         and (page is None or page in chunk.get("evidence_pages", [])
+                              or chunk["page_start"] is not None
                               and chunk["page_start"] <= page <= chunk["page_end"])
                          and (slide is None or chunk.get("slide_start") is not None
                               and chunk["slide_start"] <= slide <= chunk["slide_end"]))

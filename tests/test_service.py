@@ -77,6 +77,8 @@ class ServiceTests(unittest.TestCase):
                     retried = client.post("/api/jobs/build1/retry")
                     self.assertEqual(retried.status_code, 200)
                     self.assertEqual(submit.call_args.args[2], web._build_job)
+                    retry_record = json.loads((jobs / f"{retried.json()['job_id']}.json").read_text(encoding="utf-8"))
+                    self.assertEqual(retry_record["retried_from"], "build1")
                     errors = client.get("/api/jobs/parse1/errors").json()
                     self.assertEqual(errors["errors"], [{"type": "parse_failed", "file": "bad.pdf"}])
 
@@ -140,6 +142,63 @@ class ServiceTests(unittest.TestCase):
                     self.assertEqual(metrics["deepseek_tokens"], 15)
                     self.assertEqual(metrics["feedback"], {"positive": 0, "negative": 1})
                     self.assertNotIn("question", (service / "events.jsonl").read_text(encoding="utf-8"))
+
+    def test_activity_endpoint_surfaces_ops_only_and_no_prompt_text(self):
+        with tempfile.TemporaryDirectory() as folder:
+            service = Path(folder) / "service"
+            events = service / "events.jsonl"
+            with patch.object(web, "SERVICE", service), patch.object(web, "EVENTS", events):
+                web._event("parse", True, 12)
+                web._event("query", False, 300)
+                web._event("build", True, 5)
+                web._token_event({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+                # A hypothetical raw-prompt event must never leak its payload.
+                with web.EVENTS.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"at": "2026-01-01T00:00:00Z", "kind": "prompt",
+                                             "question": "绝密问题"}, ensure_ascii=False) + "\n")
+                with TestClient(web.app) as client:
+                    body = client.get("/api/activity").json()
+                self.assertEqual(body["counts"]["parse"], 1)
+                self.assertEqual(body["counts"]["query"], 1)
+                self.assertEqual(body["counts"]["build"], 1)
+                self.assertNotIn("prompt", body["counts"])
+                self.assertEqual({item["kind"] for item in body["events"]}, {"parse", "query", "build"})
+                self.assertNotIn("绝密问题", json.dumps(body, ensure_ascii=False))
+
+    def test_vendor_route_serves_assets_and_blocks_traversal(self):
+        with TestClient(web.app) as client:
+            # The vendored files exist relative to the source tree.
+            for asset in ("mermaid.min.js", "katex/katex.min.css", "katex/katex.min.js"):
+                response = client.get(f"/vendor/{asset}")
+                self.assertEqual(response.status_code, 200, asset)
+            self.assertEqual(client.get("/vendor/../web.py").status_code, 404)
+            self.assertEqual(client.get("/vendor/does-not-exist.js").status_code, 404)
+
+    def test_stream_endpoint_emits_sse_and_can_cancel(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            indexes = root / "indexes" / "snapshot-1"
+            indexes.mkdir(parents=True)
+            (indexes / "snapshot.json").write_text(json.dumps({"sources": [
+                {"doc_id": "doc-1", "source_file": "a.pdf", "sha256": "h"}]}), encoding="utf-8")
+            chunk = {"chunk_id": "a", "doc_id": "doc-1", "page_start": 1, "page_end": 1,
+                     "slide_start": None, "slide_end": None, "heading_path": [], "score": 0.9, "text": "证据"}
+            with patch.object(web, "INDEXES", root / "indexes"), \
+                 patch.object(web, "PARSED", root / "parsed"), \
+                 patch.object(web, "SERVICE", root / "service"), \
+                 patch.object(web, "EVENTS", root / "service" / "events.jsonl"), \
+                 patch("src.service.web.retrieve", return_value=[chunk]), \
+                 patch("src.service.web.stream_answer", return_value=iter([
+                     {"type": "delta", "text": "部分"},
+                     {"type": "done", "answer": "回答：\n完整[1]\n\n引用：\n[1] a.pdf，第1页", "fallback": False}])):
+                with TestClient(web.app) as client:
+                    response = client.post("/api/query/stream", json={
+                        "question": "问题", "answer": True, "snapshot_id": "snapshot-1"})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("data:", response.text)
+                    self.assertIn("部分", response.text)
+                    self.assertIn("done", response.text)
+                    self.assertEqual(client.post("/api/query/stream/nonexistent/cancel").status_code, 404)
 
     def test_build_job_records_real_progress(self):
         with tempfile.TemporaryDirectory() as folder:

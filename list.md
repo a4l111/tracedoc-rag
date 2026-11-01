@@ -40,6 +40,9 @@
 - [x] 已对 3 份真实 PDF 做离线资产审计：48 页、327 个图片资产均可定位，22 个视觉描述保留 `unreviewed` 标记，`errors.jsonl` 均为空；人工查看页 14/15 后确认页面与资产对应。报告：`data/benchmarks/mmlongbench_page_corrected/PARSE_AUDIT.md`。
 - [x] 已逐项核验真实 PDF 表格页、图表页、图片型扫描页和真实 PPTX 第 2 张的 Markdown、资产文件与页／slide 映射。发现扫描信息图第 4 页只有 16 个图片资产而无 OCR 文本、复杂表格列关系不稳定、PPT 图片 OCR 噪声及图表视觉描述仍待人工核验；详见 `data/validation/parse_cases/CASE_AUDIT.md`。
 - [x] 为无原生文本的 PDF 页增加可选本地整页 OCR：`python app.py parse --ocr-scanned-pages`。真实扫描信息图的独立副本实测得到 152 字符、0 解析错误，来源渲染图和 `unreviewed` 标记齐全；小字仍有误识，图表数值仍须人工逐项比对，见同一审计报告。
+- [x] 已支持 XLSX／CSV 解析：只读取已缓存单元格值与公式文本，不执行公式、宏或链接；按工作表输出标题与原行号 Markdown，并在 `manifest.json` 记录工作表维度，生成 `spreadsheet.json` 单元格快照。隐藏工作表跳过；单表上限 5000 行、100 列、100000 非空单元格、单元格 10000 字符，超限记录错误。CSV 自动识别 UTF-8/UTF-16/GB18030 与分隔符。
+- [x] 已支持 PPTX 原生结构预览：从 slide XML 提取形状位置、文本、组合层级与显式连接端点，生成带标注的结构缩略图与 Mermaid；不推断箭头方向，连接线标注为未定向，非 Office 完整渲染。
+- [x] 已支持照片人数盘点：`app.py inventory-photos` 对已保存页面渲染图逐张统计可见人数，保留页/资产溯源并标记 `unreviewed`；Build 按页生成照片 chunk，仅在整文档计数完整时生成单人照与最多人数汇总 chunk。
 
 **验收：** 能从检索结果定位到原文页／幻灯片与原图；纯 OCR 文本和视觉模型描述可区分。
 
@@ -52,6 +55,10 @@
 - [x] 已用同一 MMLongBench-Doc 小样本离线对比固定窗口／结构化切块的 BM25：两者均为 Recall@5 0.0529、Recall@20 0.4471、MRR@5 0.0735；该样本解析结果无 Markdown 标题，因此两种模式实际等价。
 - [x] 已用真实 PPTX 第 2–4 张的同一已解析语料（一级 slide 标题与从实际标题提升的二级 Markdown 标题）分别 Build 固定窗口与结构化快照：8/8 和 11/11 Chunk 均完成三路索引。三题同 Gold 的 BM25、bge-m3、Qwen3 Dense、融合精排 Recall@5/MRR 均为 1.0000；结构化 Chunk 跨 slide 数为 0，固定窗口为 3。小样本不证明通用质量提升，详见 `data/validation/chunk_modes/COMPARISON.md`。
 - [x] 已实际运行 DeepSeek 引用问答，输出引用编号只指向本次 Top 5；自动化测试覆盖资料不足、伪造引用回退和 API 失败时保留检索结果。
+- [x] 已增加独立图文向量路由：Build 时用 MoArk `Qwen3-VL-Embedding-8B` 为每张图片资产生成归一化 2048 维向量（`visual_index.faiss` / `visual_images.jsonl` / `visual_meta.json`）。该路由可选，失败只记 `visual_errors.jsonl`，不破坏文本快照完整性与页面/slide 溯源。
+- [x] 已增加受限表格计算：DeepSeek 仅提出声明式 JSON 方案（count/distinct_count/group_count/sum/avg/min/max/numeric_summary/top 与最多六个筛选条件），不接触行数据、不执行代码；确认后在本机按 `spreadsheet.json` 快照确定性执行。HMAC 签名、15 分钟时效与源/快照哈希在执行时校验，篡改或过期方案被拒绝；不重算公式、使用已有缓存、空值与异常值排除并报告。
+- [x] 已增加证据流程图：DeepSeek 返回受限 JSON 图（description/nodes/edges），结构校验（节点 ID 去重、连线引用检查、Mermaid 实体转义）后输出 `flowchart TD`；输出标注为模型生成、未经人工核验，非 JSON 文本原样通过。
+- [x] Query 增加保守技术词补充检索：首轮 Top 5 少于 2 条时，用问题中的英文/技术词再查并合并去重，保留原词、不杜撰词项。
 
 **验收：** 测试报告可复现到标注集与 snapshot；引用能打开对应来源，不出现编造的页码或图片结论。
 
@@ -77,12 +84,16 @@
 - [x] 引用可打开来源 Markdown；最终 Top 5 的每条来源按页／幻灯片关联 manifest 中实际存在的图片资产，并只读打开。若解析产物与 snapshot 来源哈希不符，不显示图片关联。
 - [x] 匿名统计已有请求次数、失败次数、耗时和 DeepSeek API 实际返回的 Token 用量；逐问题好评／差评只按 turn_id 保存评分。未返回 usage 的调用显示为未知，不估算；事件日志不保存问题正文、原文或密钥。
 - [x] 2026-10-30 使用隔离的无敏感 PDF 实际走通上传解析、共享分类、完整三路 Build、DeepSeek 带引用回答、同页图片打开、Token usage 与好评保存；记录在 `data/validation/web_flow_smoke/smoke_summary.json`。发现并修复任务列表按随机 ID 排序的问题；浏览器手工点击与跨设备验收仍待做。
+- [x] Web 增加流式回答（`/api/query/stream`，SSE）与取消端点；取消记为成功且不保存半截答案。快照含图文索引时，Query 返回 `visual_hits` 图文匹配（带页/slide 与图片 URL）。
+- [x] Web 增加 XLSX 浏览（`/api/source/{doc_id}/spreadsheet`）、表格计算（`/api/table/plan|execute`）、PPTX 幻灯片结构预览（`/api/source/{doc_id}/ppt-structure/{slide}`）与证据流程图（`/api/diagram`）；Mermaid 与 KaTeX 本地打包于 `src/service/vendor/`，离线可用；`/api/activity` 返回请求/失败次数、耗时与 DeepSeek 实际返回的 token usage。
 
 **验收：** 从添加文档到提问与回看来源可通过界面完成；服务重启后任务与 snapshot 状态仍可辨认。
 
 ## 6. 最终提交物（源码、可执行文件、介绍材料）
 
 ### 6.1 源码包
+
+- [x] 2026-10-31 已生成 `release/TraceDocRAG-source-20261031.zip`（当前工作目录快照，78 个条目），包含 XLSX、照片清单和 Word 新版；`SOURCE_STATE.txt` 明示改动尚未提交 Git。ZIP 完整性检查通过，无 `.env` 或密钥文件。
 
 - [x] 已整理并推送 GitHub 仓库，制作源码压缩包；包含 `app.py`、`src/`、`tests/`、`requirements.txt`、`config.yaml`、`.env.example`、`README.md`、`AGENTS.md`、`list.md` 和 `SUBMISSION_PLAN.md`。
 - [x] Git 索引及源码包均已检查：没有 `.env`、真实 API Key、DPAPI 密钥文件、私人文档、模型缓存、FAISS 大索引、会话数据库或请求日志；`data/validation/` 已加入忽略规则。
@@ -91,6 +102,8 @@
 - [ ] 如课程要求附带评测产物，单独提供脱敏压缩包；不要把被 `.gitignore` 忽略的大型 `data/` 直接提交 GitHub。
 
 ### 6.2 Windows 可执行文件
+
+- [x] 2026-10-31 已重建 `release/TraceDocRAG-Windows-20261031.zip`；ZIP 完整性检查通过。`TraceDocRAG.exe --help` 成功，启动本机 Web 后上传合成 XLSX，后台解析任务 `completed`、错误 0。完整模型问答未在新版可执行包内重跑。
 
 - [x] 已制作 Windows `onedir` 试运行发行包 `dist/TraceDocRAG/`，不使用难以排错的单文件模式；入口支持启动 Web，CLI 继续通过源码运行。
 - [x] 可执行包包含 Web 静态页面、默认配置和 `.env.example`，不包含真实密钥、原始文档、历史会话或个人配置。
@@ -103,13 +116,15 @@
 
 ### 6.3 介绍材料
 
-- [x] 已更新介绍文档 `docs/PROJECT_INTRO.md` 和 Word 版 `docs/TraceDoc_RAG_项目介绍.docx`：写入 18 题正式报告、原始与第 12 题人工复核后的两套指标、6 PASS / 1 FAIL 验收及答案证据不足限制。2026-10-29 通过本机 Word 导出 PDF（11 页）核验封面和指标页；逐页图示与截图仍待补齐。
+- [x] 已按 `frontend-design` skill 美化 Web 工作台并在隔离的合成 TXT/XLSX 数据上拍摄真实页面；新版截图已替换 Word 中的旧图。另用正式快照完成第 18 题真实问答并加入放大的带引用截图；已取消 Word 的 10 页限制。
+
+- [x] 已更新介绍文档 `docs/PROJECT_INTRO.md` 和 Word 新版 `docs/TraceDoc_RAG_项目介绍_更新版.docx`：加入完整评测对照、隔离演示 Web 截图、真实指标图、放大的正式带引用问答截图与课程评分对照。2026-10-31 已导出 PDF（13 页）检查关键页面。
 - [ ] 为介绍材料准备并插入真实项目截图：文档解析结果、Build 完整 snapshot、Query 最终 Top 5、DeepSeek 带引用回答、Web 首页与问答页、本机模型配置状态、正式评测报告。
 - [ ] 至少加入一张系统流程示意图，并让截图标题说明对应功能、输入和结果；Word 中的图片应保持清晰、比例正确，不出现跨页截断或难以辨认的小字。
 - [ ] 截图前统一使用演示数据并检查脱敏：不得暴露 API Key、`.env` 内容、DPAPI 文件、私人路径、个人文档、会话隐私或无关桌面信息。
 - [ ] 从已保存的 18 题正式指标和 Acceptance 报告制作脱敏截图，插入 Word；标注生成日期和 snapshot。
 - [x] Word 已分别展示原始正式指标与第 12 题人工复核补充指标，并明确原始标签下 Hybrid 低于 Dense；没有只展示较高的复核结果。
-- [ ] README 与 Markdown 介绍材料已记录第 12 题新快照的完整数值证据，以及旧快照的缺口；提交前仍需同步更新 Word 版，保留原始成绩、复核补充成绩和新快照成绩三者的区别。扫描页 OCR 误识及视觉图表描述 `unreviewed` 的限制继续保留。
+- [x] README、Markdown 与 Word 介绍材料分别记录原始成绩、人工复核补充成绩及新快照成绩；保留旧快照证据缺口与扫描 OCR、视觉描述 `unreviewed` 限制。2026-10-31 Word 新版为 13 页，含三张实测图示。
 - [x] 介绍材料已包含 3–5 分钟演示脚本：启动系统 → 选择完整 snapshot → 提问 → 查看 Top 5 → 查看 DeepSeek 回答及引用 → 打开来源；现场演练仍待完成。
 - [x] 介绍材料已包含无额度演示方案：使用已有截图、正式报告和保存的评测产物；不伪造现场模型调用成功。
 - [x] 介绍材料末尾已列出环境要求、API 服务依赖、隐私边界、已知问题和提交物；最终截图与版本号仍待补齐。

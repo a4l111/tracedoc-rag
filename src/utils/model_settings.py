@@ -29,6 +29,9 @@ DEFAULTS = {
                  "timeout": 30.0, "api_key_env": "MOARK_API_KEY"},
     "vision": {"provider": "moark", "base_url": "https://api.moark.com/v1",
                "model": "Qwen3-VL-30B-A3B-Instruct", "timeout": 60.0, "api_key_env": "MOARK_API_KEY"},
+    "visual_embedding": {"provider": "moark", "base_url": "https://api.moark.com/v1",
+                         "model": "Qwen3-VL-Embedding-8B", "dimensions": 2048,
+                         "timeout": 120.0, "api_key_env": "MOARK_API_KEY"},
 }
 
 
@@ -121,7 +124,7 @@ def set_secret(role: str, api_key: str) -> None:
         raise ValueError("API key is empty or a placeholder")
     secrets = _read_json(SECRET_PATH)
     encrypted = _protect(api_key)
-    targets = ("embedding", "reranker", "vision") if DEFAULTS[role]["provider"] == "moark" else (role,)
+    targets = ("embedding", "reranker", "vision", "visual_embedding") if DEFAULTS[role]["provider"] == "moark" else (role,)
     for target in targets:
         secrets[target] = encrypted
     _write_json(SECRET_PATH, secrets)
@@ -129,7 +132,7 @@ def set_secret(role: str, api_key: str) -> None:
 
 def delete_secret(role: str) -> None:
     secrets = _read_json(SECRET_PATH)
-    targets = ("embedding", "reranker", "vision") if DEFAULTS[role]["provider"] == "moark" else (role,)
+    targets = ("embedding", "reranker", "vision", "visual_embedding") if DEFAULTS[role]["provider"] == "moark" else (role,)
     changed = False
     for target in targets:
         if target in secrets:
