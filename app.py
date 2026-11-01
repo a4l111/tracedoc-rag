@@ -98,6 +98,9 @@ def query(
     snapshot_id: str | None = typer.Option(None, help="Exact snapshot ID; defaults to latest complete build."),
     indexes_dir: Path = typer.Option(Path("data/indexes"), help="Snapshot directory."),
     answer: bool = typer.Option(True, "--answer/--retrieval-only", help="Generate a cited DeepSeek answer or show local retrieval only."),
+    doc_id: list[str] = typer.Option([], "--doc-id", help="Repeat to restrict the search to specific document IDs."),
+    page_start: int | None = typer.Option(None, min=1, help="Only return chunks whose page range overlaps this page or later."),
+    page_end: int | None = typer.Option(None, min=1, help="Only return chunks whose page range overlaps this page or earlier."),
 ) -> None:
     """Retrieve Top 5 from one snapshot, then answer with citations by default."""
     from src.retrieval.query import latest_complete_snapshot, query as retrieve
@@ -105,7 +108,8 @@ def query(
     try:
         selected_snapshot = snapshot_id or latest_complete_snapshot(indexes_dir)
         results = retrieve(indexes_dir, selected_snapshot, question,
-                           on_step=lambda step: console.print(f"[cyan]{step}...[/cyan]"))
+                           on_step=lambda step: console.print(f"[cyan]{step}...[/cyan]"),
+                           doc_ids=doc_id or None, page_start=page_start, page_end=page_end)
     except (ValueError, FileNotFoundError, ImportError, OSError, APIError) as exc:
         console.print(f"[red]Query failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc

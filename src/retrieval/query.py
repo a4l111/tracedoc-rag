@@ -149,9 +149,38 @@ def _technical_terms(question: str) -> str:
     return terms if terms and terms != question.strip() else ""
 
 
+def _matches_filters(chunk: dict, doc_ids: list[str] | None,
+                     page_start: int | None, page_end: int | None) -> bool:
+    """True when a chunk satisfies the optional document / page-range filters.
+
+    A chunk matches the page range when its ``page_start``-``page_end`` span
+    overlaps ``[page_start, page_end]``. Chunks without a page number (slides or
+    page-less text) never match a page filter.
+    """
+    if doc_ids and chunk.get("doc_id") not in doc_ids:
+        return False
+    if page_start is not None or page_end is not None:
+        chunk_start = chunk.get("page_start")
+        chunk_end = chunk.get("page_end")
+        if not isinstance(chunk_start, int) or not isinstance(chunk_end, int):
+            return False
+        low = page_start if page_start is not None else chunk_start
+        high = page_end if page_end is not None else chunk_end
+        if chunk_end < low or chunk_start > high:
+            return False
+    return True
+
+
 def query(indexes_dir: Path, snapshot_id: str, question: str,
-          on_step: Callable[[str], None] | None = None, expand: bool = True) -> list[dict]:
+          on_step: Callable[[str], None] | None = None, expand: bool = True,
+          doc_ids: list[str] | None = None,
+          page_start: int | None = None,
+          page_end: int | None = None) -> list[dict]:
     """Retrieve 20 per route, fuse 50 by RRF, and rerank to five.
+
+    Optional ``doc_ids``, ``page_start`` and ``page_end`` narrow the candidate
+    chunks to a combined metadata filter (document list and/or page range)
+    before fusion, so the final Top 5 only contains matching evidence.
 
     When the first pass returns fewer than two chunks, conservatively re-query
     with the technical/English terms extracted from the question and merge any
@@ -161,6 +190,15 @@ def query(indexes_dir: Path, snapshot_id: str, question: str,
         raise ValueError("Invalid snapshot_id")
     if not question.strip():
         raise ValueError("Question must be nonempty")
+    if doc_ids is not None:
+        if not isinstance(doc_ids, list) or any(not isinstance(item, str) or not item.strip() for item in doc_ids):
+            raise ValueError("doc_ids must be a list of nonempty strings")
+        doc_ids = list(dict.fromkeys(doc_ids))
+    for name, value in (("page_start", page_start), ("page_end", page_end)):
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            raise ValueError(f"{name} must be a positive integer")
+    if page_start is not None and page_end is not None and page_start > page_end:
+        raise ValueError("page_start must not exceed page_end")
     report = json.loads((indexes_dir / snapshot_id / "build_report.json").read_text(encoding="utf-8"))
     if report.get("snapshot_id") != snapshot_id or not report.get("complete"):
         raise ValueError("Query requires a complete matching snapshot")
@@ -169,11 +207,15 @@ def query(indexes_dir: Path, snapshot_id: str, question: str,
     snapshot = json.loads((indexes_dir / snapshot_id / "snapshot.json").read_text(encoding="utf-8"))
     if snapshot.get("model_config", {}).get("reranker") != {"provider": "moark", "model": moark.RERANK_MODEL}:
         raise ValueError("Snapshot reranker configuration does not match MoArk; rebuild")
+    has_filter = bool(doc_ids) or page_start is not None or page_end is not None
+    retrieve_k = 50 if has_filter else 20
     rankings = {}
     for route in ROUTES:
         if on_step:
             on_step(f"Searching {route}")
-        rankings[route] = search(indexes_dir, snapshot_id, route, question, top_k=20)
+        ranking = search(indexes_dir, snapshot_id, route, question, top_k=retrieve_k)
+        rankings[route] = [chunk for chunk in ranking
+                           if _matches_filters(chunk, doc_ids, page_start, page_end)]
     hits = fuse_and_rerank(question, rankings, on_step)
     if expand and len(hits) < 2:
         technical = _technical_terms(question)
@@ -182,7 +224,9 @@ def query(indexes_dir: Path, snapshot_id: str, question: str,
                 on_step("Expanding query with technical terms")
             extra_rankings = {}
             for route in ROUTES:
-                extra_rankings[route] = search(indexes_dir, snapshot_id, route, technical, top_k=20)
+                ranking = search(indexes_dir, snapshot_id, route, technical, top_k=retrieve_k)
+                extra_rankings[route] = [chunk for chunk in ranking
+                                         if _matches_filters(chunk, doc_ids, page_start, page_end)]
             extra = fuse_and_rerank(technical, extra_rankings, on_step)
             known = {chunk["chunk_id"] for chunk in hits}
             hits = (hits + [chunk for chunk in extra if chunk["chunk_id"] not in known])[:5]

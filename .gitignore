@@ -17,3 +17,7 @@ data/benchmarks/
 data/acceptance/
 data/validation/
 /MMLongBench-Doc/
+
+# Personal documents that must never be committed.
+docs/265178-*.docx
+docs/~$*.docx

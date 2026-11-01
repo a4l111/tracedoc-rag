@@ -377,6 +377,10 @@ class QueryRequest(BaseModel):
     snapshot_id: str | None = None
     answer: bool = True
     conversation_id: str | None = None
+    doc_ids: list[str] | None = None
+    category: str | None = None
+    page_start: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
 
 
 class DiagramRequest(BaseModel):
@@ -419,16 +423,27 @@ def update_model_settings(body: ModelSettingsRequest, request: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _resolve_filter(request: QueryRequest) -> tuple[list[str] | None, int | None, int | None]:
+    """Combine explicit doc_ids and a category into one doc list plus page range."""
+    doc_ids = list(request.doc_ids) if request.doc_ids else []
+    if request.category and request.category.strip():
+        target = request.category.strip()
+        doc_ids += [doc_id for doc_id, category in _categories().items() if category == target]
+    return list(dict.fromkeys(doc_ids)) or None, request.page_start, request.page_end
+
+
 def _prepare_query(request: QueryRequest) -> dict:
     """Retrieve the final Top 5 and build hits/history for either answer path."""
     snapshot_id = request.snapshot_id or latest_complete_snapshot(INDEXES)
     if not snapshot_id.replace("-", "").isalnum():
         raise ValueError("无效 snapshot ID")
+    doc_ids, page_start, page_end = _resolve_filter(request)
     conversations = Conversations(SERVICE / "conversations.sqlite3")
     history = conversations.history(request.conversation_id)
     previous_questions = "\n".join(item["question"] for item in history[-6:])[-8000:]
     retrieval_question = (previous_questions + "\n当前问题：" + request.question) if previous_questions else request.question
-    chunks = retrieve(INDEXES, snapshot_id, retrieval_question)
+    chunks = retrieve(INDEXES, snapshot_id, retrieval_question,
+                      doc_ids=doc_ids, page_start=page_start, page_end=page_end)
     snapshot = json.loads((INDEXES / snapshot_id / "snapshot.json").read_text(encoding="utf-8"))
     names = {item["doc_id"]: item["source_file"] for item in snapshot["sources"]}
     source_hashes = {item["doc_id"]: item.get("sha256") for item in snapshot["sources"]}
@@ -446,6 +461,16 @@ def _prepare_query(request: QueryRequest) -> dict:
     visual_hits = []
     try:
         for item in visual_search(INDEXES, snapshot_id, request.question, top_k=5):
+            if doc_ids and item.get("doc_id") not in doc_ids:
+                continue
+            if page_start is not None or page_end is not None:
+                page = item.get("page")
+                if not isinstance(page, int):
+                    continue
+                if page_start is not None and page < page_start:
+                    continue
+                if page_end is not None and page > page_end:
+                    continue
             name = Path(item["path"]).name
             visual_hits.append({"doc_id": item["doc_id"], "page": item.get("page"),
                                 "slide": item.get("slide"), "kind": item.get("kind"),

@@ -135,8 +135,8 @@ def configure_styles(doc: Document) -> None:
     normal.font.name = BODY_FONT
     normal.font.size = Pt(10.5)
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), BODY_FONT)
-    normal.paragraph_format.line_spacing = 1.35
-    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.line_spacing = 1.2
+    normal.paragraph_format.space_after = Pt(4)
 
     title = styles["Title"]
     title.font.name = BODY_FONT
@@ -150,9 +150,9 @@ def configure_styles(doc: Document) -> None:
         title_p_pr.remove(title_border)
 
     for style_name, size, before, after in (
-        ("Heading 1", 17, 18, 8),
-        ("Heading 2", 13.5, 14, 6),
-        ("Heading 3", 11.5, 10, 4),
+        ("Heading 1", 17, 13, 6),
+        ("Heading 2", 13.5, 10, 5),
+        ("Heading 3", 11.5, 8, 3),
     ):
         style = styles[style_name]
         style.font.name = BODY_FONT
@@ -187,7 +187,7 @@ def add_cover(doc: Document) -> None:
     summary.paragraph_format.space_after = Pt(38)
     add_inline_markdown(
         summary,
-        "面向 PDF、DOCX、PPTX、TXT 和图片的解析、三路混合检索、Qwen3 精排与 DeepSeek 引用问答。",
+        "面向 PDF、DOCX、PPTX、XLSX、TXT 和图片的解析、三路混合检索、Qwen3 精排与 DeepSeek 引用问答。",
         size=11.5,
         color="444444",
     )
@@ -198,9 +198,9 @@ def add_cover(doc: Document) -> None:
     widths = (Cm(4.0), Cm(8.2))
     values = (
         ("文档用途", "课程作业介绍与演示说明"),
-        ("当前状态", "提交前草稿"),
-        ("评测日期", "2026-10-29"),
-        ("评测范围", "18 题正式报告与第 12 题人工复核补充报告"),
+        ("当前状态", "提交版候选，已加入实测图示"),
+        ("评测日期", "2026-10-30"),
+        ("评测范围", "18 题原始、复核及新快照三套结果"),
     )
     for row, values_row in zip(meta.rows, values):
         for index, (cell, value) in enumerate(zip(row.cells, values_row)):
@@ -217,30 +217,9 @@ def add_cover(doc: Document) -> None:
     note = doc.add_paragraph()
     note.alignment = WD_ALIGN_PARAGRAPH.CENTER
     note.paragraph_format.space_before = Pt(42)
-    run = note.add_run("原始标签与人工复核后的补充指标分别展示，来源见第 8 节。")
+    run = note.add_run("原始标签、人工复核标签和新快照指标分别展示，来源见第 8 节。")
     set_run_font(run, size=9.5, color="666666")
     doc.add_page_break()
-
-
-def add_overview(doc: Document) -> None:
-    doc.add_heading("阅读说明", level=1)
-    paragraph = doc.add_paragraph()
-    add_inline_markdown(
-        paragraph,
-        "本文介绍系统目标、技术路线、运行方式、评测结果和已知限制。系统已经形成可运行的完整工程链路。18 题原始标签评测中，融合精排 Recall@5 低于 Dense 单路；第 12 题人工复核后的补充指标与 Dense 持平，但该题最终证据块仍缺少计算答案的完整数值。两种结果分别展示。",
-    )
-
-    doc.add_heading("内容导航", level=2)
-    items = (
-        "第 1 至 3 节：项目目标与系统架构",
-        "第 4 至 7 节：解析、Build、Query、CLI 与 Web",
-        "第 8 节：18 题正式评测与人工复核",
-        "第 9 至 10 节：安全边界和已知限制",
-        "第 11 至 13 节：演示脚本、运行环境和提交物",
-    )
-    for item in items:
-        paragraph = doc.add_paragraph(style="List Bullet")
-        add_inline_markdown(paragraph, item)
 
 
 def add_table(doc: Document, rows: list[list[str]]) -> None:
@@ -341,6 +320,20 @@ def add_markdown_body(doc: Document, markdown: str) -> None:
             # Cover metadata already presents the opening status block.
             index += 1
             continue
+        image_match = re.fullmatch(r"!\[([^]]+)\]\(([^)]+)\)", stripped)
+        if image_match:
+            caption, relative_path = image_match.groups()
+            image_path = (SOURCE.parent / relative_path).resolve()
+            if not image_path.is_relative_to(SOURCE.parent.resolve()):
+                raise ValueError("Report image must be inside docs")
+            paragraph = doc.add_paragraph()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.add_run().add_picture(str(image_path), width=Cm(15.4))
+            caption_paragraph = doc.add_paragraph()
+            caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            add_inline_markdown(caption_paragraph, caption, size=8.5, color="555555")
+            index += 1
+            continue
         if stripped.startswith("|") and index + 1 < len(lines) and lines[index + 1].strip().startswith("|"):
             rows, index = parse_table(lines, index)
             add_table(doc, rows)
@@ -350,6 +343,8 @@ def add_markdown_body(doc: Document, markdown: str) -> None:
         if heading_match:
             level = min(len(heading_match.group(1)) - 1, 3)
             current_heading = heading_match.group(2)
+            if current_heading.startswith("12.1 正式带引用问答截图"):
+                doc.add_page_break()
             doc.add_heading(current_heading, level=level)
             index += 1
             continue
@@ -378,8 +373,20 @@ def add_markdown_body(doc: Document, markdown: str) -> None:
         index += 1
 
 
-def build() -> Path:
+def build(output: Path = OUTPUT) -> Path:
     markdown = SOURCE.read_text(encoding="utf-8")
+    architecture_start = markdown.index("```text", markdown.index("## 3. 系统架构"))
+    architecture_end = markdown.index("```", architecture_start + 3) + 3
+    markdown = (markdown[:architecture_start]
+                + "```text\n文档 → Markdown / manifest / images\n"
+                  "→ 固定窗口或结构化 Chunk → 共享快照\n"
+                  "→ BM25 + Qwen3 Dense + bge-m3\n"
+                  "→ RRF Top 50 → Qwen3 Reranker Top 5\n"
+                  "→ DeepSeek 带引用回答 → CLI / Web\n```"
+                + markdown[architecture_end:])
+    checklist_start = markdown.index("### 8.4 提交前核对")
+    next_section = markdown.index("## 9. 安全、隐私与可复现性", checklist_start)
+    markdown = markdown[:checklist_start] + markdown[next_section:]
     doc = Document()
     configure_styles(doc)
 
@@ -405,17 +412,16 @@ def build() -> Path:
     core.keywords = "RAG, 多模态文档, Qwen3, DeepSeek, 检索增强生成"
 
     add_cover(doc)
-    add_overview(doc)
     add_markdown_body(doc, markdown)
 
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(OUTPUT)
-    return OUTPUT
+    output.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(output)
+    return output
 
 
 if __name__ == "__main__":
     try:
-        output = build()
+        output = build(Path(sys.argv[1]) if len(sys.argv) > 1 else OUTPUT)
     except Exception as exc:
         print(f"生成失败：{exc}", file=sys.stderr)
         raise
